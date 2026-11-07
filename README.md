@@ -172,8 +172,11 @@ box.open(sealed)
   caller's role, with `kms:Decrypt` on `*` in the caller's IAM policy);
   KMS would give back the forger's data key, and the value would open to
   a plaintext of their choosing. The AWS Encryption SDK guards against
-  the same with its strict mode. Nothing is cached but the key an alias
-  resolved to. The sealed bytes, for other code to read:
+  the same with its strict mode. The key an alias resolved to is kept 5
+  minutes; with an alias or a bare id, `open` needs `kms:DescribeKey`
+  too, and each value refused costs one DescribeKey (KMS's request
+  quota is shared). The key may be in the caller's own account as well
+  as another's. The sealed bytes, for other code to read:
 
   | bytes | |
   |---|---|

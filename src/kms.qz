@@ -370,12 +370,12 @@ class KMS
   # kept, encrypted under the KMS key, with the ciphertext. For secrets
   # over KMS's 4 KB, and for many secrets without a KMS call each to
   # encrypt (opening one decrypts its data key through KMS). Nothing is
-  # cached.
+  # cached but the key an alias names (`RESOLVED_FOR`).
   #
   # A sealed value is one `Bytes`: a version byte (1); the length of the
   # KMS key's ARN (one byte) and the ARN, as `generate_data_key` gave it
-  # (`open` decrypts under that key, so that an alias moved since does
-  # not matter); the encrypted data key's length (two bytes, big-endian)
+  # (`open` decrypts under that key, when it accepts it: the key `key_id`
+  # names, or one of `allowed_keys`); the encrypted data key's length (two bytes, big-endian)
   # and the key; the 12-byte nonce; then the ciphertext and its 16-byte
   # tag. The bytes before the ciphertext are its additional
   # authenticated data, so that none of them can be changed either.
@@ -398,15 +398,25 @@ class KMS
     # The key ARNs `open` accepts besides the one `key_id` names (that of
     # an alias's previous key, once it was moved).
     allowed_keys: Array[String] = Array[String].new,
-    # The key ARN an alias or a bare key id resolved to (`describe_key`).
-    resolved: Atom[String?] = Atom[String?].new(nil)
+    # :nodoc:
+    # What an alias or a bare key id resolved to (`describe_key`), with
+    # the key id it was for (a copy made with `with` may name another)
+    # and when.
+    resolved: Atom[Resolution?] = Atom[Resolution?].new(nil)
   )
+    # :nodoc:
+    data Resolution = (key_id: String, arn: String, at: Duration)
+
+    # How long the key an alias resolved to is kept before it is asked
+    # again (a moved alias is also followed at the first value it
+    # refuses).
+    RESOLVED_FOR = 5.minutes
     # The format's version byte.
     VERSION = 1
     # The nonce's size.
     NONCE_SIZE = 12
     # A KMS key's ARN (not an alias's).
-    KEY_ARN = /\Aarn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key\/[A-Za-z0-9-]+\z/
+    KEY_ARN = /\Aarn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key\/[A-Za-z0-9-]+\z/
 
     # `plaintext` sealed under a new data key.
     def seal(plaintext: Bytes | String) -> Bytes
@@ -426,6 +436,7 @@ class KMS
     #
     # ## Raises
     #
+    # `ArgumentError` when `allowed_keys` holds what is not a key ARN.
     # `AWS::Error` for bytes that are not a sealed value of this format,
     # were altered, or name a key not accepted: `AWS::ServiceError`, a
     # subclass, when KMS will not
@@ -466,7 +477,12 @@ class KMS
         return if arn == key_id
         raise Error.new("sealed under #{arn}, which is not the key #{key_id} nor in allowed_keys")
       end
-      current = resolved.get || resolve
+      kept = resolved.get
+      current = if kept && kept.key_id == key_id && Time.monotonic - kept.at < RESOLVED_FOR
+                  kept.arn
+                else
+                  resolve
+                end
       return if arn == current
       current = resolve
       return if arn == current
@@ -476,7 +492,7 @@ class KMS
     # The key ARN `key_id` names now.
     private def resolve -> String
       arn = kms.describe_key(key_id: key_id).arn
-      resolved.set(arn)
+      resolved.set(Resolution.new(key_id, arn, Time.monotonic))
       arn
     end
 

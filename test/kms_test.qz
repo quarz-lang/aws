@@ -394,6 +394,34 @@ class EnvelopeKeysTest < Test::Case
     end
   end
 
+  def test_a_copy_for_another_key_resolves_its_own
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      a = AWS::KMS::Envelope.new(kms, "alias/app", ctx)
+      sealed = a.seal("x")
+      a.open(sealed)
+      b = a.with(key_id: "alias/other")
+      e = assert_raise(AWS::Error) { b.open(sealed) }
+      assert_match(/which is not the key alias\/other points to/, e.message)
+    end
+  end
+
+  def test_the_resolution_is_kept_five_minutes
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      box = AWS::KMS::Envelope.new(kms, "alias/app", ctx)
+      old = box.seal("before")
+      box.open(old)
+      fake.alias_target.set(FakeKMS::OTHER_ARN)
+      # Within the lifetime: the key kept still opens the old value.
+      assert_equal("before".to_bytes, box.open(old))
+      # Past it: asked again, the old key is no longer the alias's.
+      r = box.resolved.get.as(AWS::KMS::Envelope::Resolution)
+      box.resolved.set(r.with(at: r.at - 6.minutes))
+      assert_raise(AWS::Error) { box.open(old) }
+    end
+  end
+
   def test_allowed_keys_are_key_arns
     KMSFakes.with(FakeKMS.make) do |kms|
       sealed = AWS::KMS::Envelope.new(kms, "alias/app", ctx).seal("x")
