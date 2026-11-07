@@ -1,0 +1,116 @@
+require "test"
+
+class SigV4UnitTest < Test::Case
+  # The example keys of the AWS documentation's S3 examples.
+  def s3_keys -> AWS::Credentials::Keys
+    AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+  end
+
+  def suite_keys -> AWS::Credentials::Keys
+    AWS::Credentials::Keys.new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+  end
+
+  def t -> Time = Time.utc(2013, 5, 24)
+
+  # The S3 documentation's "GET Object" example (header signing).
+  def test_s3_get_object_example
+    req = HTTP::Client::Request.get("https://examplebucket.s3.amazonaws.com/test.txt", {"Range" => "bytes=0-9"})
+    signed = AWS::SigV4.sign(req, service: "s3", region: "us-east-1", credentials: s3_keys, time: t)
+    assert_equal(AWS::SigV4::EMPTY_SHA256, signed.headers["x-amz-content-sha256"])
+    assert_equal("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
+                 signed.headers["authorization"])
+  end
+
+  # The S3 documentation's presigned URL example.
+  def test_s3_presign_example
+    req = HTTP::Client::Request.get("https://examplebucket.s3.amazonaws.com/test.txt")
+    url = AWS::SigV4.presign(req, service: "s3", region: "us-east-1", credentials: s3_keys, expires_in: 86400.seconds, time: t)
+    assert_equal("examplebucket.s3.amazonaws.com", url.host)
+    assert_equal("/test.txt", url.path)
+    assert((url.query || "").end_with?("&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"), url.to_s)
+    assert((url.query || "").include?("X-Amz-Expires=86400"))
+  end
+
+  def test_presign_bounds_and_token
+    req = HTTP::Client::Request.get("https://example.amazonaws.com/")
+    assert_raise(ArgumentError) { AWS::SigV4.presign(req, service: "s", region: "r", credentials: suite_keys, expires_in: 0.seconds) }
+    assert_raise(ArgumentError) { AWS::SigV4.presign(req, service: "s", region: "r", credentials: suite_keys, expires_in: 8.days) }
+    k = AWS::Credentials::Keys.new("AKIDEXAMPLE", "secret", "to+ken/=")
+    url = AWS::SigV4.presign(req, service: "s", region: "r", credentials: k, expires_in: 1.minute)
+    assert((url.query || "").include?("X-Amz-Security-Token=to%2Bken%2F%3D"))
+  end
+
+  def test_session_token_and_existing_authorization
+    req = HTTP::Client::Request.get("https://example.amazonaws.com/").header("Authorization", "old").header("User-Agent", "x")
+    k = AWS::Credentials::Keys.new("AKIDEXAMPLE", "secret", "tok")
+    signed = AWS::SigV4.sign(req, service: "service", region: "us-east-1", credentials: k, time: t)
+    assert_equal("tok", signed.headers["x-amz-security-token"])
+    assert_equal(1, signed.headers.all("authorization").size)
+    # User-Agent is never signed.
+    assert(signed.headers["authorization"].as(String).include?("SignedHeaders=host;x-amz-date;x-amz-security-token,"))
+  end
+
+  def test_host_from_the_url
+    req = HTTP::Client::Request.get("https://example.amazonaws.com:8443/")
+    signed = AWS::SigV4.sign(req, service: "service", region: "us-east-1", credentials: suite_keys, time: t)
+    assert_equal("example.amazonaws.com:8443", signed.headers["host"])
+    req = HTTP::Client::Request.get("https://example.amazonaws.com:443/")
+    assert_equal("example.amazonaws.com", AWS::SigV4.sign(req, service: "s", region: "r", credentials: suite_keys, time: t).headers["host"])
+  end
+
+  def test_payload_hashes
+    stream = HTTP::Client::Request.stream("PUT", "https://example.amazonaws.com/o") { |w| w.write("x") }
+    e = assert_raise(ArgumentError) { AWS::SigV4.sign(stream, service: "s3", region: "r", credentials: suite_keys) }
+    assert_match(/payload_hash: or unsigned_payload: true/, e.message)
+    signed = AWS::SigV4.sign(stream, service: "s3", region: "r", credentials: suite_keys, unsigned_payload: true)
+    assert_equal("UNSIGNED-PAYLOAD", signed.headers["x-amz-content-sha256"])
+    h = Digest::SHA256.hexdigest("x")
+    signed = AWS::SigV4.sign(stream, service: "s", region: "r", credentials: suite_keys, payload_hash: h)
+    assert_equal(h, signed.headers["x-amz-content-sha256"])
+    bin = HTTP::Client::Request.post("https://example.amazonaws.com/", body: b"\x00\x01")
+    signed = AWS::SigV4.sign(bin, service: "s", region: "r", credentials: suite_keys, content_sha256: true)
+    assert_equal(Digest::SHA256.hexdigest(b"\x00\x01"), signed.headers["x-amz-content-sha256"])
+    # Not asked for, not added.
+    assert(!AWS::SigV4.sign(bin, service: "s", region: "r", credentials: suite_keys).headers.key?("x-amz-content-sha256"))
+  end
+
+  def test_content_length_is_signed_when_it_is_the_bodys
+    req = HTTP::Client::Request.post("https://example.amazonaws.com/", body: "abc").header("Content-Length", "3")
+    signed = AWS::SigV4.sign(req, service: "s", region: "r", credentials: suite_keys, time: t)
+    assert(signed.headers["authorization"].as(String).include?("SignedHeaders=content-length;host;x-amz-date,"))
+    e = assert_raise(ArgumentError) { AWS::SigV4.sign(req.header("Content-Length", "4"), service: "s", region: "r", credentials: suite_keys) }
+    assert_equal("a Content-Length of 4 on a body of 3 bytes", e.message)
+    stream = HTTP::Client::Request.stream("PUT", "https://example.amazonaws.com/o", {"Content-Length" => "1"}) { |w| w.write("x") }
+    assert_raise(ArgumentError) { AWS::SigV4.sign(stream, service: "s", region: "r", credentials: suite_keys, unsigned_payload: true) }
+    # Not carried, not added.
+    plain = AWS::SigV4.sign(HTTP::Client::Request.post("https://example.amazonaws.com/", body: "abc"), service: "s", region: "r", credentials: suite_keys)
+    assert(!plain.headers.key?("content-length"))
+  end
+
+  def test_canonical_paths
+    # Every service but S3: normalized, each segment encoded (twice for
+    # an encoded path).
+    assert_equal("/a%2520b/c", AWS::SigV4.canonical_path("/a%20b/c", "kms"))
+    assert_equal("/c/", AWS::SigV4.canonical_path("//a/../c//", "kms"))
+    assert_equal("/", AWS::SigV4.canonical_path("", "kms"))
+    # S3: as it is, encoded once.
+    assert_equal("/a%20b/../c", AWS::SigV4.canonical_path("/a%20b/../c", "s3"))
+    assert_equal("/a%20b//c%E1%88%B4", AWS::SigV4.canonical_path("/a b//cሴ", "s3"))
+  end
+
+  def test_canonical_query
+    assert_equal("", AWS::SigV4.canonical_query(nil))
+    # (Sorted by bytes: "10" before "2".)
+    assert_equal("a=&b=10&b=2", AWS::SigV4.canonical_query("b=2&a&b=10"))
+    assert_equal("x=a%20b&y=%2B", AWS::SigV4.canonical_query("y=%2B&x=a%20b"))
+  end
+
+  def test_signer
+    creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+    signer = AWS::SigV4::Signer.new("service", "us-east-1", creds)
+    req = HTTP::Client::Request.get("https://example.amazonaws.com/")
+    a = signer.sign(req).headers["authorization"].as(String)
+    assert(a.start_with?("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"))
+    assert(a.include?("/us-east-1/service/aws4_request"))
+  end
+end

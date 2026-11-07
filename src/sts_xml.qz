@@ -1,0 +1,94 @@
+# :nodoc:
+# A reader of STS's XML answers, for the few fields the credentials
+# providers need: not a general XML parser. It reads elements (their
+# attributes and namespace prefixes skipped), text with the five
+# predefined entities and character references, an XML declaration and
+# comments, and refuses anything else (a DOCTYPE, CDATA, a processing
+# instruction, a stray `<` or `&`, unbalanced tags), so that nothing it
+# does not understand passes for an answer.
+module STSXML
+  # The text of every element whose local name (the prefix dropped) is
+  # in `names`, by that name; the first one wins. Raises
+  # `CredentialsError` on what it does not read.
+  def self.fields(xml: String, names: Array[String]) -> Hash[String, String]
+    out = Hash::Builder[String, String].new
+    stack: Array[String] = []
+    text = String::Builder.new
+    i = 0
+    n = xml.size
+    while i < n
+      c = xml[i, 1]
+      if c == "<"
+        close = xml.index(">", i) || STSXML.refuse("an unterminated tag")
+        tag = xml[i + 1, close - i - 1]
+        if tag.start_with?("?")
+          STSXML.refuse("a processing instruction") unless i == STSXML.lead(xml) && tag.start_with?("?xml") && tag.end_with?("?")
+        elsif tag.start_with?("!--")
+          close = (xml.index("-->", i + 4) || STSXML.refuse("an unterminated comment")) + 2
+        elsif tag.start_with?("!")
+          STSXML.refuse("a DOCTYPE or CDATA section")
+        elsif tag.start_with?("/")
+          name = STSXML.local(tag[1, tag.size - 1].strip)
+          STSXML.refuse("an unbalanced </#{name}>") if stack.empty? || stack.last != name
+          stack = stack.take(stack.size - 1)
+          out[name] = text.to_s.strip if names.include?(name) && !out.key?(name)
+          text = String::Builder.new
+        else
+          empty = tag.end_with?("/")
+          body = empty ? tag[0, tag.size - 1] : tag
+          name = STSXML.local(body.split(/\s/)[0]? || "")
+          STSXML.refuse("an element without a name") if name.empty?
+          if empty
+            out[name] = "" if names.include?(name) && !out.key?(name)
+          else
+            stack = stack.push(name)
+          end
+          text = String::Builder.new
+        end
+        i = close + 1
+      elsif c == "&"
+        semi = xml.index(";", i) || STSXML.refuse("an unterminated entity")
+        text << STSXML.entity(xml[i + 1, semi - i - 1])
+        i = semi + 1
+      else
+        text << c
+        i += 1
+      end
+    end
+    STSXML.refuse("unclosed elements") unless stack.empty?
+    out.to_h
+  end
+
+  # :nodoc:
+  def self.refuse(what: String) -> Nothing
+    raise CredentialsError.new("STS answered XML this reader does not take: #{what}")
+  end
+
+  # :nodoc:
+  # Where the document starts, past leading whitespace.
+  def self.lead(xml: String) -> Int = xml.size - xml.lstrip.size
+
+  # :nodoc:
+  def self.local(name: String) -> String
+    _, _, after = name.rpartition(":")
+    after
+  end
+
+  # :nodoc:
+  def self.entity(name: String) -> String
+    case name
+    in "lt" then "<"
+    in "gt" then ">"
+    in "amp" then "&"
+    in "quot" then "\""
+    in "apos" then "'"
+    else
+      code = if name.match?(/\A#x[0-9A-Fa-f]{1,6}\z/) then name[2, name.size - 2].to_i(16)
+             elsif name.match?(/\A#[0-9]{1,7}\z/) then name[1, name.size - 1].to_i
+             else nil
+             end
+      STSXML.refuse("the entity &#{name};") if code.nil? || code <= 0 || code > 0x10FFFF
+      code.chr
+    end
+  end
+end

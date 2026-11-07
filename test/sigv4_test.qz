@@ -1,0 +1,83 @@
+require "test"
+
+# One case of the SigV4 test suite (test/fixtures/sigv4/README.md).
+data SuiteCase(
+  name: String,
+  request: HTTP::Client::Request,
+  keys: AWS::Credentials::Keys,
+  region: String,
+  service: String,
+  time: Time,
+  sign_body: Bool
+)
+  DIR = "test/fixtures/sigv4"
+
+  def self.names -> Array[String]
+    Dir.children(DIR).select { |n| File.directory?("#{DIR}/#{n}") }.sort
+  end
+
+  def self.file(name: String, file: String) -> String = File.read("#{DIR}/#{name}/#{file}")
+
+  def self.load(name: String) -> SuiteCase
+    ctx = JSON.parse(SuiteCase.file(name, "context.json"))
+    c = ctx["credentials"]
+    keys = AWS::Credentials::Keys.new(c["access_key_id"].as_s, c["secret_access_key"].as_s, c["token"]?&.as_s?, nil)
+    lines = SuiteCase.file(name, "request.txt").split("\n", -1)
+    method, target, _ = lines[0].split(" ")
+    headers = HTTP::Headers.empty
+    host = ""
+    i = 1
+    while i < lines.size && !lines[i].empty?
+      k, _, v = lines[i].partition(":")
+      host = v.strip if k.downcase == "host"
+      headers = headers.add(k, v)
+      i += 1
+    end
+    body = i + 1 < lines.size ? lines.drop(i + 1).join("\n") : ""
+    content = body.empty? ? HTTP::Content::Empty : HTTP::Content::Text.new(body)
+    req = HTTP::Client::Request.new(method, "https://#{host}#{target}", headers: headers, body: content)
+    SuiteCase.new(name, req, keys, ctx["region"].as_s, ctx["service"].as_s, Time.iso8601(ctx["timestamp"].as_s), ctx["sign_body"].as_bool)
+  end
+
+  # The `Authorization` of the expected signed request.
+  def expected_authorization -> String
+    line = SuiteCase.file(name, "header-signed-request.txt").split("\n").find { |l| l.downcase.start_with?("authorization:") }
+    line.as(String).partition(":")[2]
+  end
+
+  # The query of the expected presigned request, its pairs sorted.
+  def expected_query -> Array[String]
+    target = SuiteCase.file(name, "query-signed-request.txt").split("\n")[0].split(" ")[1]
+    target.partition("?")[2].split("&").sort
+  end
+end
+
+class SigV4SuiteTest < Test::Case
+  def test_the_suite_has_its_cases
+    assert(SuiteCase.names.size >= 25, SuiteCase.names.join(", "))
+  end
+
+  def test_header_signing_at_every_stage
+    SuiteCase.names.each do |n|
+      c = SuiteCase.load(n)
+      signed = AWS::SigV4.sign(c.request, service: c.service, region: c.region, credentials: c.keys, time: c.time,
+                               content_sha256: c.sign_body)
+      hash = signed.headers["x-amz-content-sha256"] || AWS::SigV4.payload_hash(c.request, nil, false)
+      parts = AWS::SigV4.parts(c.request.method, c.request.url, signed.headers.delete("authorization"), hash,
+                               service: c.service, region: c.region, credentials: c.keys, time: c.time)
+      assert_equal(SuiteCase.file(n, "header-canonical-request.txt"), parts.canonical_request, "#{n}: canonical request")
+      assert_equal(SuiteCase.file(n, "header-string-to-sign.txt"), parts.string_to_sign, "#{n}: string to sign")
+      assert_equal(SuiteCase.file(n, "header-signature.txt").strip, parts.signature, "#{n}: signature")
+      assert_equal(c.expected_authorization, signed.headers["authorization"], "#{n}: Authorization")
+    end
+  end
+
+  def test_query_signing
+    SuiteCase.names.each do |n|
+      c = SuiteCase.load(n)
+      url = AWS::SigV4.presign(c.request, service: c.service, region: c.region, credentials: c.keys,
+                               expires_in: 3600.seconds, time: c.time)
+      assert_equal(c.expected_query, (url.query || "").split("&").sort, "#{n}: query")
+    end
+  end
+end

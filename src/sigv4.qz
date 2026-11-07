@@ -1,0 +1,269 @@
+require "digest"
+require "uri"
+require "http"
+
+# AWS Signature Version 4: signs an `HTTP::Client::Request` for any AWS
+# service, with the `Authorization` header (`.sign`) or in the query
+# (`.presign`), as the specification describes
+# (docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html).
+#
+# ```
+# keys = AWS::Credentials::Keys.new(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+# req = HTTP::Client::Request.get("https://example.amazonaws.com/")
+# signed = AWS::SigV4.sign(req, service: "service", region: "us-east-1", credentials: keys, time: Time.utc(2015, 8, 30, 12, 36))
+# signed.headers["x-amz-date"]   # => "20150830T123600Z"
+# signed.headers["authorization"]
+# # => "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+# ```
+module SigV4
+  # The algorithm's name, in the `Authorization` header and the string to
+  # sign.
+  ALGORITHM = "AWS4-HMAC-SHA256"
+  # The payload hash of an unsigned body (`unsigned_payload: true`).
+  UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
+  # The SHA-256 of nothing: the payload hash of a request without a body.
+  EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  # The headers never signed: the signature's own, those a proxy or the
+  # client may change (`User-Agent`, `Expect`), and the hop-by-hop ones.
+  # (`Content-Length` is signed when the request carries one: `.sign`.)
+  UNSIGNED_HEADERS = ["authorization", "user-agent", "expect", "connection", "transfer-encoding", "keep-alive", "te", "upgrade", "proxy-authorization", "x-amzn-trace-id"]
+
+  # What a signature is made of, each stage of the specification: the
+  # canonical request, the headers it signs (`host;x-amz-date`), the
+  # string to sign and the signature (lowercase hexadecimal).
+  data Parts = (canonical_request: String, signed_headers: String, string_to_sign: String, signature: String)
+
+  # `request` signed for `service` in `region` with `credentials`, at
+  # `time`: with `Host` (from the URL, when it has none), `X-Amz-Date`,
+  # `X-Amz-Security-Token` (for temporary keys), `X-Amz-Content-Sha256`
+  # (for `s3`, with `content_sha256: true`, `payload_hash:` or
+  # `unsigned_payload: true`) and `Authorization`. Every header the
+  # request has is signed but `UNSIGNED_HEADERS`.
+  #
+  # The payload hash is the body's SHA-256 (`Content::Text`,
+  # `Content::Binary`; that of nothing for `Content::Empty`), `payload_hash`
+  # when given, or `UNSIGNED-PAYLOAD` with `unsigned_payload: true`; a
+  # `Content::Stream` body needs one of the last two.
+  #
+  # ## Raises
+  #
+  # `ArgumentError` for a `Content::Stream` body without `payload_hash` or
+  # `unsigned_payload`, or a `Content-Length` header that is not the
+  # body's size (or on a streamed body, which is sent chunked).
+  def self.sign(request: HTTP::Client::Request, *, service: String, region: String, credentials: Credentials::Keys,
+                time: Time = Time.now, payload_hash: String? = nil, unsigned_payload: Bool = false,
+                content_sha256: Bool = false) -> HTTP::Client::Request
+    t = time.utc
+    amz_date = SigV4.amz_date(t)
+    hash = SigV4.payload_hash(request, payload_hash, unsigned_payload)
+    SigV4.check_length(request)
+    h = request.headers.delete("authorization")
+    h = h.put("host", HTTP::Client.host_header(request.url)) unless h.key?("host")
+    h = h.put("x-amz-date", amz_date)
+    if token = credentials.session_token
+      h = h.put("x-amz-security-token", token)
+    end
+    if service == "s3" || content_sha256 || payload_hash || unsigned_payload
+      h = h.put("x-amz-content-sha256", hash)
+    end
+    parts = SigV4.parts(request.method, request.url, h, hash, service: service, region: region,
+                        credentials: credentials, time: t)
+    scope = SigV4.scope(t, region, service)
+    auth = "#{ALGORITHM} Credential=#{credentials.access_key_id}/#{scope}, SignedHeaders=#{parts.signed_headers}, Signature=#{parts.signature}"
+    request.with(headers: h.put("authorization", auth))
+  end
+
+  # The URL of `request` signed in its query, valid for `expires_in` from
+  # `time` (at most 7 days): `X-Amz-Algorithm`, `X-Amz-Credential`,
+  # `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-SignedHeaders` (`host` and the
+  # request's other headers but `UNSIGNED_HEADERS`), `X-Amz-Security-Token`
+  # for temporary keys, and `X-Amz-Signature` last. The payload hash is
+  # `UNSIGNED-PAYLOAD` for `s3`, else the body's, as `.sign` takes it.
+  #
+  # ```
+  # keys = AWS::Credentials::Keys.new(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+  # req = HTTP::Client::Request.get("https://example.amazonaws.com/")
+  # url = AWS::SigV4.presign(req, service: "service", region: "us-east-1", credentials: keys, expires_in: 1.hour, time: Time.utc(2015, 8, 30, 12, 36))
+  # url.query.as(String).end_with?("X-Amz-Signature=e93c787ed7f371d5c6b165c1b38ede9550f4dce4144713e844b25b7192d3865d")   # => true
+  # ```
+  #
+  # ## Raises
+  #
+  # `ArgumentError` for `expires_in` under a second or over 7 days, and as
+  # `.sign` does.
+  def self.presign(request: HTTP::Client::Request, *, service: String, region: String, credentials: Credentials::Keys,
+                   expires_in: Duration, time: Time = Time.now) -> URI
+    seconds = expires_in.to_ms / 1000
+    raise ArgumentError, "expires_in out of 1 second to 7 days: #{expires_in}" if expires_in.to_ms < 1000 || seconds > 604_800
+    t = time.utc
+    hash = service == "s3" ? UNSIGNED_PAYLOAD : SigV4.payload_hash(request, nil, false)
+    SigV4.check_length(request)
+    h = request.headers.delete("authorization")
+    h = h.put("host", HTTP::Client.host_header(request.url)) unless h.key?("host")
+    names = SigV4.signed_names(h)
+    params = [
+      ["X-Amz-Algorithm", ALGORITHM],
+      ["X-Amz-Credential", "#{credentials.access_key_id}/#{SigV4.scope(t, region, service)}"],
+      ["X-Amz-Date", SigV4.amz_date(t)],
+      ["X-Amz-Expires", seconds.to_s],
+      ["X-Amz-SignedHeaders", names.join(";")]
+    ]
+    if token = credentials.session_token
+      params = params.push(["X-Amz-Security-Token", token])
+    end
+    added = params.map { |p| "#{SigV4.encode(p[0])}=#{SigV4.encode(p[1])}" }.join("&")
+    q = request.url.query
+    query = q.nil? || q.empty? ? added : "#{q}&#{added}"
+    url = request.url.with(query: query)
+    parts = SigV4.parts(request.method, url, h, hash, service: service, region: region, credentials: credentials, time: t)
+    url.with(query: "#{query}&X-Amz-Signature=#{parts.signature}")
+  end
+
+  # The stages of the signature of a request: `method`, `url`, `headers`
+  # (as they will be sent, `Host` included) and the payload's hash, for
+  # `service` in `region` at `time`. `.sign` and `.presign` are made of
+  # it; tests compare each stage with the specification's.
+  def self.parts(method: String, url: URI, headers: HTTP::Headers, payload_hash: String, *, service: String,
+                 region: String, credentials: Credentials::Keys, time: Time) -> Parts
+    t = time.utc
+    names = SigV4.signed_names(headers)
+    canonical_headers = names.map { |n| "#{n}:#{headers.all(n).map { |v| SigV4.trim(v) }.join(",")}\n" }.join
+    signed = names.join(";")
+    creq = [method, SigV4.canonical_path(url.path, service), SigV4.canonical_query(url.query), canonical_headers, signed, payload_hash].join("\n")
+    scope = SigV4.scope(t, region, service)
+    sts = [ALGORITHM, SigV4.amz_date(t), scope, Digest::SHA256.hexdigest(creq)].join("\n")
+    key = SigV4.signing_key(credentials.secret_access_key, t.strftime("%Y%m%d"), region, service)
+    Parts.new(creq, signed, sts, SigV4.hex(Digest::HMAC.sha256(key, sts)))
+  end
+
+  # A signer for one service and region, with a credentials provider
+  # asked for keys at each request (cached by the provider): what a
+  # service client holds.
+  #
+  # ```
+  # creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+  # signer = AWS::SigV4::Signer.new("kms", "us-east-1", creds)
+  # signer.sign(HTTP::Client::Request.get("https://kms.us-east-1.amazonaws.com/")).headers.key?("authorization")   # => true
+  # ```
+  data Signer(
+    # The service's signing name: `kms`, `s3`.
+    service: String,
+    # The region: `us-east-1`.
+    region: String,
+    # Where the keys come from.
+    credentials: Credentials::Provider
+  )
+    # `request` signed now (`SigV4.sign`'s keywords but the three this
+    # signer holds).
+    def sign(request: HTTP::Client::Request, *, payload_hash: String? = nil, unsigned_payload: Bool = false,
+             content_sha256: Bool = false) -> HTTP::Client::Request
+      SigV4.sign(request, service: service, region: region, credentials: credentials.get, payload_hash: payload_hash,
+                 unsigned_payload: unsigned_payload, content_sha256: content_sha256)
+    end
+  end
+
+  # The key that signs for `service` in `region` on `date` (`20150830`):
+  # `HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region), service), "aws4_request")`.
+  def self.signing_key(secret: String, date: String, region: String, service: String) -> Bytes
+    k = Digest::HMAC.sha256("AWS4#{secret}", date)
+    k = Digest::HMAC.sha256(k, region)
+    k = Digest::HMAC.sha256(k, service)
+    Digest::HMAC.sha256(k, "aws4_request")
+  end
+
+  # The credential scope: `20150830/us-east-1/service/aws4_request`.
+  def self.scope(time: Time, region: String, service: String) -> String
+    "#{time.utc.strftime("%Y%m%d")}/#{region}/#{service}/aws4_request"
+  end
+
+  # :nodoc:
+  def self.amz_date(t: Time) -> String = t.utc.strftime("%Y%m%dT%H%M%SZ")
+
+  # :nodoc:
+  # The names of the headers signed, lowercased, sorted, once each.
+  def self.signed_names(headers: HTTP::Headers) -> Array[String]
+    names: Array[String] = []
+    headers.each { |n, _| names = names.push(n) unless names.include?(n) || UNSIGNED_HEADERS.include?(n) }
+    names.sort
+  end
+
+  # :nodoc:
+  # A header value as signed: without leading and trailing whitespace,
+  # each run of spaces one space.
+  def self.trim(value: String) -> String = value.strip.gsub(/ +/, " ")
+
+  # :nodoc:
+  # The hash of the payload (`.sign`).
+  def self.payload_hash(request: HTTP::Client::Request, given: String?, unsigned: Bool) -> String
+    return UNSIGNED_PAYLOAD if unsigned
+    return given if given
+    case request.body
+    in HTTP::Content::Empty then EMPTY_SHA256
+    in HTTP::Content::Text(text) then Digest::SHA256.hexdigest(text)
+    in HTTP::Content::Binary(bytes) then Digest::SHA256.hexdigest(bytes)
+    in HTTP::Content::Stream(_)
+      raise ArgumentError, "a streamed body needs payload_hash: or unsigned_payload: true"
+    end
+  end
+
+  # :nodoc:
+  # A `Content-Length` the request carries is signed: it must be what the
+  # client will send (the body's size; a streamed body is sent chunked).
+  def self.check_length(request: HTTP::Client::Request) -> Void
+    given = request.headers["content-length"]
+    return if given.nil?
+    size = case request.body
+           in HTTP::Content::Empty then 0
+           in HTTP::Content::Text(text) then text.bytesize
+           in HTTP::Content::Binary(bytes) then bytes.size
+           in HTTP::Content::Stream(_)
+             raise ArgumentError, "a Content-Length on a streamed body (it is sent chunked)"
+           end
+    unless given.strip == size.to_s
+      raise ArgumentError, "a Content-Length of #{given.strip} on a body of #{size} bytes"
+    end
+  end
+
+  # :nodoc:
+  # The canonical URI: for every service but S3, the path normalized
+  # (dot segments removed, runs of `/` one) and each segment encoded (so
+  # a percent-encoded path is encoded twice, as the specification says);
+  # for S3, the path as it is, each segment decoded and encoded once.
+  def self.canonical_path(path: String, service: String) -> String
+    p = path.empty? ? "/" : path
+    p = "/#{p}" unless p.start_with?("/")
+    if service == "s3"
+      return p.split("/", -1).map { |s| SigV4.encode(URI.decode(s, false) || s) }.join("/")
+    end
+    p = URI.remove_dot_segments(p.gsub(/\/+/, "/"))
+    p = "/" if p.empty?
+    p.split("/", -1).map { |s| SigV4.encode(s) }.join("/")
+  end
+
+  # :nodoc:
+  # The canonical query: each name and value decoded and encoded again
+  # (the unreserved set kept, the rest percent-encoded, a space `%20`),
+  # sorted by name then value; a name without `=` has an empty value.
+  def self.canonical_query(query: String?) -> String
+    return "" if query.nil? || query.empty?
+    pairs: Array[Array[String]] = []
+    query.split("&").each do |p|
+      next if p.empty?
+      k, _, v = p.partition("=")
+      pairs = pairs.push([SigV4.encode(URI.decode(k, false) || k), SigV4.encode(URI.decode(v, false) || v)])
+    end
+    pairs.sort { |a, b| a[0] == b[0] ? a[1] <=> b[1] : a[0] <=> b[0] }.map { |p| "#{p[0]}=#{p[1]}" }.join("&")
+  end
+
+  # :nodoc:
+  # Percent-encoding as SigV4 wants it: `A-Z a-z 0-9 - . _ ~` kept, every
+  # other byte `%XY` (upper case).
+  def self.encode(text: String) -> String = URI.encode_component(text)
+
+  # :nodoc:
+  def self.hex(bytes: Bytes) -> String
+    out = String::Builder.new
+    bytes.each { |b| out << "0123456789abcdef"[b / 16] << "0123456789abcdef"[b % 16] }
+    out.to_s
+  end
+end
