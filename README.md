@@ -48,8 +48,12 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
   - `web_identity`: STS `AssumeRoleWithWebIdentity` (unsigned) with
     `AWS_WEB_IDENTITY_TOKEN_FILE` (read at each refresh), `AWS_ROLE_ARN`,
     `AWS_ROLE_SESSION_NAME`;
-  - `chain(providers)`: the first that answers, the one that answered
-    tried first afterwards; `CredentialsError` names what each said;
+  - `chain(providers)`: the first that answers, tried in order until
+    one does (`CredentialsError` names what each said). Once one has
+    answered, it is the chain's: its later failure is the chain's error,
+    never other keys of another identity. A profile named by
+    `AWS_PROFILE`, or the default one when it has `role_arn`, that cannot
+    give keys stops the chain (`AWS::ProfileError`);
   - `default`: `chain([env, web_identity, profile, container, instance])`.
 - Temporary keys are cached and refreshed 5 minutes before they expire,
   by one task at a time (the others go on with the kept keys, or wait
