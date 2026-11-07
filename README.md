@@ -149,15 +149,33 @@ box.open(sealed)
   plaintexts out).
 - Throttling (`ThrottlingException`, 429), 5xx answers,
   `KMSInternalException`, `DependencyTimeoutException` and transport
-  errors are tried again; an answer that the request's time is too far
-  from the server's is tried once more with the server's time, which
-  later requests keep.
+  errors are tried again (every operation here is safe to send twice);
+  an answer that may mean a clock skew (`InvalidSignatureException`,
+  `SignatureDoesNotMatch`, `RequestExpired`, `RequestInTheFuture`,
+  `RequestTimeTooSkewed`) with a `Date` over 4 minutes from ours is tried
+  once more with the server's time, which later requests keep.
+- Requests follow no redirect (`Config.client`, the default): a
+  redirect would take the body (a plaintext) elsewhere. The region must
+  be a host label.
 - `KMS::Envelope`: each `seal` makes a data key (`generate_data_key`,
-  bound to the encryption context) and encrypts with AES-256-GCM; the
-  sealed bytes are a version byte (1), the encrypted data key's length
-  (2 bytes) and the key, a 12-byte nonce, the ciphertext and its tag, the
-  bytes before the ciphertext authenticated with it. `open` decrypts the
-  data key through KMS. Nothing is cached.
+  bound to the encryption context) and encrypts with AES-256-GCM.
+  `open` decrypts the data key through KMS under the key ARN the sealed
+  value names (so that an alias moved to another key since does not
+  matter), with the same encryption context. Nothing is cached. The
+  sealed bytes, for other code to read:
+
+  | bytes | |
+  |---|---|
+  | 1 | version: `1` |
+  | 1 | the length `a` of the KMS key's ARN (up to 255) |
+  | `a` | the ARN (UTF-8), as `GenerateDataKey` answered it |
+  | 2 | the length `n` of the encrypted data key, big-endian |
+  | `n` | the encrypted data key (KMS's `CiphertextBlob`) |
+  | 12 | the AES-GCM nonce |
+  | rest | the ciphertext, then its 16-byte tag |
+
+  The data key is 32 bytes (AES-256); the bytes before the ciphertext
+  are its additional authenticated data.
 
 ### Errors
 

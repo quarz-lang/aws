@@ -17,8 +17,10 @@ data Config(
   # Where to send every service's requests (a local emulator), nil for
   # AWS's endpoints.
   endpoint: URI? = nil,
-  # The client the requests go through.
-  http: HTTP::Client = HTTP::Client.default,
+  # The client the requests go through (`Config.client` by default: one
+  # that follows no redirect, which would take a request's body
+  # elsewhere).
+  http: HTTP::Client = Config.client,
   # How many times a request is tried again after a failure that may
   # pass: throttling, a 5xx, a transport error.
   retries: Int = 3,
@@ -52,16 +54,38 @@ data Config(
         services[k[17, k.size - 17].downcase] = URI.parse(v)
       end
     end
-    Config.new(region, Credentials.default(env), general ? URI.parse(general) : nil, HTTP::Client.default, 3, 30.seconds,
+    Config.new(region, Credentials.default(env), general ? URI.parse(general) : nil, Config.client, 3, 30.seconds,
                100.milliseconds, 20.seconds, services.to_h)
   end
 
   # :nodoc:
   def self.nonempty(s: String?) -> String? = s && !s.empty? ? s : nil
 
+  # :nodoc:
+  CLIENT = Atom[HTTP::Client?].new(nil)
+
+  # The client service clients use unless given another: the defaults of
+  # `HTTP::Client`, but no redirect followed. Made on first use.
+  def self.client -> HTTP::Client
+    loop do
+      made = CLIENT.get
+      return made if made
+      c = HTTP::Client.new(max_redirects: 0)
+      return c if CLIENT.compare_and_set(made, c)
+    end
+  end
+
   # Where `service`'s requests go (`kms`): its own endpoint, else
   # `endpoint`, else `https://<service>.<region>.amazonaws.com`.
+  #
+  # ## Raises
+  #
+  # `ArgumentError` for a region that is not a host label (it would name
+  # another host): `us-east-1`, not `x.example/`.
   def endpoint_for(service: String) -> URI
+    unless region.match?(/\A[a-z0-9]+(-[a-z0-9]+)*\z/)
+      raise ArgumentError, "not a region: #{region.inspect}"
+    end
     service_endpoints[service.downcase]? || endpoint || URI.parse("https://#{service}.#{region}.amazonaws.com")
   end
 

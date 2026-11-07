@@ -28,9 +28,11 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
     d = req.headers["x-amz-date"] || ""
     if d.size == 16
       t = Time.utc(d[0, 4].to_i, d[4, 2].to_i, d[6, 2].to_i, d[9, 2].to_i, d[11, 2].to_i, d[13, 2].to_i)
-      if (t - now).to_ms.abs > 300_000
-        return FakeKMS.error(400, "InvalidSignatureException", "Signature expired: #{d} is now earlier than #{now.utc.strftime("%Y%m%dT%H%M%SZ")}",
-                             now)
+      stamp = now.utc.strftime("%Y%m%dT%H%M%SZ")
+      if (t - now).to_ms > 300_000
+        return FakeKMS.error(400, "InvalidSignatureException", "Signature not yet current: #{d} is still later than #{stamp}", now)
+      elsif (now - t).to_ms > 300_000
+        return FakeKMS.error(400, "InvalidSignatureException", "Signature expired: #{d} is now earlier than #{stamp}", now)
       end
     end
     unless FakeKMS.signed?(req, body) && req.headers["content-type"] == AWS::KMS::CONTENT_TYPE && req.method == "POST" && req.path == "/"
@@ -53,6 +55,12 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
       return HTTP::Server::Response.text("{\"message\":\"not allowed\"}", 400).header("x-amzn-ErrorType", "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/")
                                                                        .header("x-amzn-RequestId", "req-denied")
     end
+    if key == "alias/grant" && doc["GrantTokens"]?.to_s != "[\"g1\"]"
+      return FakeKMS.error(400, "InvalidGrantTokenException", "", now)
+    end
+    if key == "alias/redirect"
+      return HTTP::Server::Response.redirect("http://127.0.0.1:1/", 307)
+    end
     ctx = doc["EncryptionContext"]?
     ctx_json = ctx ? ctx.to_json : "{}"
     case target
@@ -60,6 +68,10 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
       blob = FakeKMS.blob(ctx_json, Base64.decode(doc["Plaintext"].as_s))
       FakeKMS.json({"CiphertextBlob" => Base64.encode(blob), "KeyId" => ARN, "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
     in "TrentService.Decrypt"
+      # (As KMS: a KeyId given must be the key the blob is under.)
+      if key && key != ARN
+        return FakeKMS.error(400, "IncorrectKeyException", "", now)
+      end
       blob = Base64.decode(doc["CiphertextBlob"].as_s)
       text = blob.decode? || ""
       parts = text.split("|", 3)
@@ -268,6 +280,46 @@ class KMSTest < Test::Case
     assert_raise(AWS::Error) { AWS::Config.default({"HOME" => "/nonexistent"}) }
   end
 
+  def test_clock_skew_when_ours_is_ahead
+    fake = FakeKMS.make
+    fake.offset.set(-3_600_000)
+    KMSFakes.with(fake) do |kms|
+      assert_equal(FakeKMS::ARN, kms.encrypt(key_id: "alias/app", plaintext: "x").key_id)
+      assert_equal(2, fake.calls.get)
+    end
+  end
+
+  def test_grant_tokens_and_no_redirects
+    KMSFakes.with(FakeKMS.make) do |kms|
+      kms.encrypt(key_id: "alias/grant", plaintext: "x", grant_tokens: ["g1"])
+      e = assert_raise(AWS::ServiceError) { kms.encrypt(key_id: "alias/grant", plaintext: "x") }.as(AWS::ServiceError)
+      assert_equal("InvalidGrantTokenException", e.code)
+    end
+    fake = FakeKMS.make
+    server = HTTP::Server.new(fake.handler, host: "127.0.0.1", port: 0)
+    Task.scope do |scope|
+      scope.spawn { server.serve }
+      begin
+        creds = AWS::Credentials.static(access_key_id: FakeKMS::KEY_ID, secret_access_key: FakeKMS::SECRET)
+        # The default client: no redirect followed (the body would go
+        # with it).
+        config = AWS::Config.new(region: "us-east-1", credentials: creds, endpoint: URI.parse("http://127.0.0.1:#{server.local_address.port}"),
+                                 retries: 0)
+        e = assert_raise(AWS::ServiceError) { AWS::KMS.new(config).encrypt(key_id: "alias/redirect", plaintext: "TOPSECRET") }.as(AWS::ServiceError)
+        assert_equal(307, e.status)
+      ensure
+        server.shutdown
+      end
+    end
+  end
+
+  def test_regions_are_host_labels
+    creds = AWS::Credentials.static(access_key_id: "a", secret_access_key: "s")
+    ["us-east-1.evil.example#", "evil.example/", "", "US-EAST-1"].each do |r|
+      assert_raise(ArgumentError) { AWS::KMS.new(AWS::Config.new(region: r, credentials: creds)) }
+    end
+  end
+
   def test_http_date
     assert_equal(Time.utc(2026, 11, 7, 12, 0, 1), AWS::KMS.http_date("Sat, 07 Nov 2026 12:00:01 GMT"))
     assert_nil(AWS::KMS.http_date("yesterday"))
@@ -281,14 +333,30 @@ class EnvelopeTest < Test::Case
       box = AWS::KMS::Envelope.new(kms, "alias/app", {"tenant" => "t1"})
       big = "x" * 10_000
       sealed = box.seal(big)
+      arn = FakeKMS::ARN.to_bytes
       assert_equal(1, sealed[0])
+      assert_equal(arn.size, sealed[1])
+      assert_equal(arn, sealed.slice(2, arn.size))
       assert_equal(big.to_bytes, box.open(sealed))
       assert(box.seal(big) != sealed)
-      # Each byte of the head and the body is protected.
-      [0, 5, sealed.size - 20, sealed.size - 1].each do |i|
+      # The version, the ARN, the key's length, the key, the nonce, the
+      # ciphertext and the tag: none can be changed.
+      blob_len = sealed[2 + arn.size] * 256 + sealed[3 + arn.size]
+      nonce_at = 4 + arn.size + blob_len
+      [0, 5, 2 + arn.size, 6 + arn.size, nonce_at, nonce_at + 11, nonce_at + 12, sealed.size - 1].each do |i|
         altered = sealed.slice(0, i) + Bytes[(sealed[i] + 1) % 256] + sealed.slice(i + 1, sealed.size - i - 1)
-        assert_raise(AWS::Error) { box.open(altered) }
+        begin
+          box.open(altered)
+          flunk("byte #{i} altered, opened anyway")
+        rescue AWS::Error
+          nil
+        end
       end
+      # A data key that is not an AES-256 one.
+      small = kms.encrypt(key_id: "alias/app", plaintext: Bytes[1, 2, 3, 4, 5], encryption_context: {"tenant" => "t1"}).ciphertext_blob
+      forged = Bytes[1, arn.size] + arn + Bytes[small.size / 256, small.size % 256] + small + Crypto.random_bytes(28)
+      e = assert_raise(AWS::Error) { box.open(forged) }
+      assert_equal("not a sealed value: a data key of 5 bytes", e.message)
       assert_raise(AWS::Error) { box.open(Bytes[1, 0]) }
       # Another context: KMS refuses the data key.
       other = AWS::KMS::Envelope.new(kms, "alias/app", {"tenant" => "t2"})

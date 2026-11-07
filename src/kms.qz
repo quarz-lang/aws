@@ -32,7 +32,11 @@ class KMS
   CONTENT_TYPE = "application/x-amz-json-1.1"
   # The codes tried again, besides the 5xx statuses and 429.
   RETRIED_CODES = ["ThrottlingException", "KMSInternalException", "DependencyTimeoutException", "RequestTimeout",
-                   "LimitExceededException", "TooManyRequestsException"]
+                   "TooManyRequestsException"]
+  # The codes that may mean the request's time is too far from the
+  # server's (corrected only when the server's Date says so).
+  SKEW_CODES = ["InvalidSignatureException", "SignatureDoesNotMatch", "RequestExpired", "RequestInTheFuture",
+                "RequestTimeTooSkewed"]
 
   # `encrypt`'s answer.
   data EncryptOutput = (ciphertext_blob: Bytes, key_id: String, encryption_algorithm: String)
@@ -219,9 +223,14 @@ class KMS
       error = KMS.error(status, headers, text)
       if !skewed && KMS.skew?(error)
         if server = KMS.http_date(headers["date"])
-          @skew.set((server - Time.now).to_ms)
-          skewed = true
-          next
+          # (Corrected when the server's clock is over 4 minutes from
+          # ours as corrected so far, either way, as botocore does.)
+          diff = (server - Time.now).to_ms
+          if (diff - @skew.get).abs > 240_000
+            @skew.set(diff)
+            skewed = true
+            next
+          end
         end
       end
       raise error unless attempt < @config.retries && KMS.retry?(error)
@@ -335,12 +344,9 @@ class KMS
   end
 
   # :nodoc:
-  # Whether the answer says the request's time is too far from the
-  # server's.
-  def self.skew?(e: ServiceError) -> Bool
-    return true if e.code == "RequestTimeTooSkewed" || e.code == "RequestExpired"
-    e.code == "InvalidSignatureException" && e.detail.match?(/signature expired|request time|too skewed|clock/i)
-  end
+  # Whether the answer may say the request's time is too far from the
+  # server's: its code; the server's Date decides.
+  def self.skew?(e: ServiceError) -> Bool = SKEW_CODES.include?(e.code)
 
   # :nodoc:
   MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -363,11 +369,13 @@ class KMS
   # encrypt (opening one decrypts its data key through KMS). Nothing is
   # cached.
   #
-  # A sealed value is one `Bytes`: a version byte (1), the encrypted
-  # data key's length (two bytes, big-endian) and the key, the 12-byte
-  # nonce, then the ciphertext and its 16-byte tag. The bytes before the
-  # ciphertext are its additional authenticated data, so that none of
-  # them can be changed either.
+  # A sealed value is one `Bytes`: a version byte (1); the length of the
+  # KMS key's ARN (one byte) and the ARN, as `generate_data_key` gave it
+  # (`open` decrypts under that key, so that an alias moved since does
+  # not matter); the encrypted data key's length (two bytes, big-endian)
+  # and the key; the 12-byte nonce; then the ciphertext and its 16-byte
+  # tag. The bytes before the ciphertext are its additional
+  # authenticated data, so that none of them can be changed either.
   #
   # ```
   # creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
@@ -394,30 +402,38 @@ class KMS
     def seal(plaintext: Bytes | String) -> Bytes
       dk = kms.generate_data_key(key_id: key_id, key_spec: :aes_256, encryption_context: encryption_context)
       blob = dk.ciphertext_blob
-      raise Error.new("an encrypted data key of #{blob.size} bytes") if blob.size > 65_535
+      arn = dk.key_id.to_bytes
+      raise Error.new("a key ARN of #{arn.size} bytes (255 at most)") if arn.empty? || arn.size > 255
+      raise Error.new("an encrypted data key of #{blob.size} bytes") if blob.empty? || blob.size > 65_535
       nonce = Crypto.random_bytes(NONCE_SIZE)
-      head = Bytes[VERSION, blob.size / 256, blob.size % 256] + blob + nonce
-      sealed = Crypto::AES::GCM.new(dk.plaintext).seal(nonce, plaintext, aad: head)
-      head + sealed
+      head = Bytes[VERSION, arn.size] + arn + Bytes[blob.size / 256, blob.size % 256] + blob + nonce
+      head + Crypto::AES::GCM.new(dk.plaintext).seal(nonce, plaintext, aad: head)
     end
 
-    # The plaintext of `sealed`, its data key decrypted through KMS.
+    # The plaintext of `sealed`, its data key decrypted through KMS
+    # under the key the header names (an alias moved since does not
+    # matter).
     #
     # ## Raises
     #
     # `AWS::Error` for bytes that are not a sealed value of this format
     # or were altered; `AWS::ServiceError` when KMS will not decrypt the
-    # data key (another encryption context, another key's).
+    # data key (another encryption context).
     def open(sealed: Bytes) -> Bytes
-      raise Error.new("not a sealed value: too short") if sealed.size < 3
+      raise Error.new("not a sealed value: too short") if sealed.size < 2
       raise Error.new("not a sealed value: version #{sealed[0]}") unless sealed[0] == VERSION
-      n = sealed[1] * 256 + sealed[2]
-      rest = 3 + n + NONCE_SIZE
-      raise Error.new("not a sealed value: too short") if sealed.size < rest + 16
-      blob = sealed.slice(3, n)
-      nonce = sealed.slice(3 + n, NONCE_SIZE)
+      a = sealed[1]
+      raise Error.new("not a sealed value: too short") if sealed.size < 2 + a + 2
+      arn = sealed.slice(2, a).decode? || raise Error.new("not a sealed value: the key ARN is not UTF-8")
+      n = sealed[2 + a] * 256 + sealed[3 + a]
+      start = 4 + a
+      rest = start + n + NONCE_SIZE
+      raise Error.new("not a sealed value: too short") if a == 0 || n == 0 || sealed.size < rest + 16
+      blob = sealed.slice(start, n)
+      nonce = sealed.slice(start + n, NONCE_SIZE)
       head = sealed.slice(0, rest)
-      key = kms.decrypt(ciphertext_blob: blob, encryption_context: encryption_context, key_id: key_id).plaintext
+      key = kms.decrypt(ciphertext_blob: blob, encryption_context: encryption_context, key_id: arn).plaintext
+      raise Error.new("not a sealed value: a data key of #{key.size} bytes") unless key.size == 32
       Crypto::AES::GCM.new(key).open?(nonce, sealed.slice(rest, sealed.size - rest), aad: head) ||
         raise Error.new("the sealed value was altered")
     end
