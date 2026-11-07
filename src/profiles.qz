@@ -23,7 +23,8 @@ module Profiles
   # The region of profile `name` (AWS_PROFILE, else `default`), nil
   # when it has none.
   def self.region(name: String? = nil, env: Hash[String, String] = ENV) -> String?
-    s = Profiles.settings(name || env["AWS_PROFILE"]? || "default", env)
+    p = env["AWS_PROFILE"]?
+    s = Profiles.settings(name || (p && !p.empty? ? p : nil) || "default", env)
     s ? s["region"]? : nil
   end
 
@@ -46,8 +47,8 @@ module Profiles
     return {} unless File.file?(path)
     text = begin
              File.read(path)
-           rescue IOError, SystemCallError
-             return {}
+           rescue StandardError => e
+             raise CredentialsError.new("cannot read #{path} (#{e.class.name})")
            end
     Profiles.parse(text, config)
   end
@@ -62,11 +63,22 @@ module Profiles
   def self.parse(text: String, config: Bool) -> Hash[String, Hash[String, String]]
     out = Hash::Builder[String, Hash[String, String]].new
     current: String? = nil
+    # (Whether an indented line is a setting: right under a section, as
+    # configparser takes it; after a setting, a sub-setting or the
+    # value's continuation.)
+    after_section = false
     text.split("\n").each do |raw|
       line = raw.strip
       next if line.empty? || line.start_with?("#") || line.start_with?(";")
-      next if raw.start_with?(" ") || raw.start_with?("\t")
-      if m = line.match(/\A\[([^\]]*)\]\s*(?:[#;].*)?\z/)
+      next if (raw.start_with?(" ") || raw.start_with?("\t")) && !after_section
+      if line.start_with?("[")
+        m = line.match(/\A\[([^\]]*)\]\s*(?:[#;].*)?\z/)
+        after_section = true
+        # (A malformed header: what follows is no profile's.)
+        if m.nil?
+          current = nil
+          next
+        end
         section = m[1].as(String).strip
         current = if !config || section == "default"
                     section
@@ -80,6 +92,7 @@ module Profiles
         end
         next
       end
+      after_section = false
       c = current
       next if c.nil?
       k, eq, v = line.partition("=")

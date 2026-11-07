@@ -34,8 +34,9 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
     signed with the source profile's own keys (one level, or the profile
     itself; with `external_id`, `duration_seconds`, `role_session_name`
     when given), before the profile's own keys. A profile named by
-    `AWS_PROFILE` (or given) that neither file has raises
-    `AWS::ProfileNotFound`, which stops a chain;
+    `AWS_PROFILE` (or given) whose keys cannot be had raises
+    `AWS::ProfileError` (`AWS::ProfileNotFound` when neither file has
+    it), which stops a chain rather than find other keys;
   - `container`: ECS and EKS Pod Identity,
     `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI` (https on any
     host; http only on loopback, `169.254.170.2`, `169.254.170.23` or
@@ -51,9 +52,11 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
     tried first afterwards; `CredentialsError` names what each said;
   - `default`: `chain([env, web_identity, profile, container, instance])`.
 - Temporary keys are cached and refreshed 5 minutes before they expire,
-  by one task at a time (the others go on with the kept keys); a failed
-  refresh keeps the old keys until they expire (and is not tried again
-  for 10 seconds), then raises `AWS::CredentialsError`. Any error a
+  by one task at a time (the others go on with the kept keys, or wait
+  for the new ones); a failed refresh keeps the old keys until they
+  expire, then raises `AWS::CredentialsError`. A refresh that failed, or
+  brought keys already within the 5 minutes, is not tried again for 10
+  seconds. Any error a
   provider meets is a `CredentialsError`; none follows redirects.
 - `inspect` of a provider names it (`#<AWS::Credentials environment>`),
   never what it holds.

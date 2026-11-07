@@ -40,7 +40,8 @@ module SigV4
   # `unsigned_payload: true`) and Authorization. Every header the
   # request has is signed but `UNSIGNED_HEADERS`.
   #
-  # The payload hash is the body's SHA-256 (`HTTP::Content::Text`,
+  # The payload hash is an `X-Amz-Content-Sha256` the request carries,
+  # else the body's SHA-256 (`HTTP::Content::Text`,
   # `HTTP::Content::Binary`; that of nothing for `HTTP::Content::Empty`), `payload_hash`
   # when given, or `UNSIGNED-PAYLOAD` with `unsigned_payload: true`; a
   # `HTTP::Content::Stream` body needs one of the last two.
@@ -111,7 +112,7 @@ module SigV4
     end
     added = params.map { |p| "#{SigV4.encode(p[0])}=#{SigV4.encode(p[1])}" }.join("&")
     # (A query signed before: its signature's parameters dropped.)
-    kept = (request.url.query || "").split("&").reject { |p| p.empty? || p.downcase.start_with?("x-amz-") }
+    kept = (request.url.query || "").split("&").reject { |p| p.empty? || PRESIGN_PARAMS.include?(p.partition("=")[0].downcase) }
     query = kept.empty? ? added : "#{kept.join("&")}&#{added}"
     url = request.url.with(query: query)
     parts = SigV4.parts(request.method, url, h, hash, service: service, region: region, credentials: credentials, time: t)
@@ -182,6 +183,12 @@ module SigV4
   end
 
   # :nodoc:
+  # The query parameters of a query signature (lowercased): those of one
+  # made before are dropped, the caller's other `x-amz-*` ones kept.
+  PRESIGN_PARAMS = ["x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-expires", "x-amz-signedheaders",
+                    "x-amz-security-token", "x-amz-signature"]
+
+  # :nodoc:
   def self.amz_date(t: Time) -> String = t.utc.strftime("%Y%m%dT%H%M%SZ")
 
   # :nodoc:
@@ -190,7 +197,7 @@ module SigV4
   # as the client will send it (from the URL, whatever the request
   # says).
   def self.base_headers(request: HTTP::Client::Request) -> HTTP::Headers
-    h = request.headers.delete("authorization").delete("x-amz-date").delete("x-amz-security-token").delete("x-amz-content-sha256")
+    h = request.headers.delete("authorization").delete("x-amz-date").delete("x-amz-security-token")
     h.put("host", HTTP::Client.host_header(request.url))
   end
 
@@ -212,6 +219,11 @@ module SigV4
   def self.payload_hash(request: HTTP::Client::Request, given: String?, unsigned: Bool) -> String
     return UNSIGNED_PAYLOAD if unsigned
     return given if given
+    # (One the caller set, or an earlier signature: the hash the service
+    # gets.)
+    if set = request.headers["x-amz-content-sha256"]
+      return set
+    end
     case request.body
     in HTTP::Content::Empty then EMPTY_SHA256
     in HTTP::Content::Text(text) then Digest::SHA256.hexdigest(text)

@@ -22,13 +22,14 @@ module STSXML
     n = xml.size
     while i < n
       c = xml[i, 1]
-      if c == "<"
+      if c == "<" && xml[i, 4] == "<!--"
+        close = (xml.index("-->", i + 4) || STSXML.refuse("an unterminated comment")) + 2
+        i = close + 1
+      elsif c == "<"
         close = STSXML.tag_end(xml, i + 1)
         tag = xml[i + 1, close - i - 1]
         if tag.start_with?("?")
           STSXML.refuse("a processing instruction") unless i == STSXML.lead(xml) && tag.start_with?("?xml ") && tag.end_with?("?")
-        elsif tag.start_with?("!--")
-          close = (xml.index("-->", i + 4) || STSXML.refuse("an unterminated comment")) + 2
         elsif tag.start_with?("!")
           STSXML.refuse("a DOCTYPE or CDATA section")
         elsif tag.start_with?("/")
