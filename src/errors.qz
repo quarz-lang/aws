@@ -1,0 +1,5 @@
+# The root of every error this cog raises: `rescue AWS::Error` catches
+# them all. (An argument a method cannot take is an `ArgumentError`, as
+# anywhere.)
+class Error < StandardError
+end

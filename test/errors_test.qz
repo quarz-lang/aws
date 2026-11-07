@@ -1,0 +1,9 @@
+require "test"
+
+class ErrorsTest < Test::Case
+  def test_error_is_a_standard_error
+    e = AWS::Error.new("x")
+    assert(e.is_a?(StandardError))
+    assert_equal("x", e.message)
+  end
+end

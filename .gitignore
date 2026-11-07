@@ -1,0 +1,4 @@
+/.quarz/
+/doc/
+# This machine's [patch], should pg depend on a cog (docs/10 §2).
+/Cog.local.toml
