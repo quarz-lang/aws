@@ -33,7 +33,12 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
     `source_profile` is the role's temporary keys, from STS `AssumeRole`
     signed with the source profile's own keys (one level, or the profile
     itself; with `external_id`, `duration_seconds`, `role_session_name`
-    when given), before the profile's own keys. A profile named by
+    when given), before the profile's own keys. With `credential_source`
+    instead of `source_profile`, the role's keys are had with those of
+    `env` (`Environment`), `instance` (`Ec2InstanceMetadata`) or
+    `container` (`EcsContainer`); another value, or both settings
+    (mutually exclusive, as in the SDKs), raises `AWS::ProfileError`
+    before any request. A profile named by
     `AWS_PROFILE` (or given), or one with `role_arn` (the default one
     included), whose keys cannot be had raises `AWS::ProfileError`
     (`AWS::ProfileNotFound` when neither file has it), which stops a
