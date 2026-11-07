@@ -157,26 +157,27 @@ box.open(sealed)
 - Requests follow no redirect (`Config.client`, the default): a
   redirect would take the body (a plaintext) elsewhere. The region must
   be a host label.
-- `KMS::Envelope.new(kms, key_id, encryption_context, allowed_keys = [])`:
-  each `seal` makes a data key (`generate_data_key`, bound to the
+- `KMS::Envelope.new(kms, key_id, encryption_context, allowed_keys =
+  [])`: each `seal` makes a data key (`generate_data_key`, bound to the
   encryption context) and encrypts with AES-256-GCM. `open` decrypts the
   data key through KMS under the key ARN the sealed value names, with
   the same encryption context, but only when that ARN is the key
   `key_id` names (an alias or a bare id resolved with `describe_key`,
-  again once before refusing, so that a moved alias is followed) or one
-  of `allowed_keys` (key ARNs: an alias's previous key, for values sealed
-  before it moved). Nothing else is ever passed to Decrypt. Why: a
-  sealed value names its key, and the encryption context is no secret,
-  so anyone could seal a value under a key of their own that the caller
-  may decrypt with (another account's key whose policy allows the
-  caller's role, with `kms:Decrypt` on `*` in the caller's IAM policy,
-  or any key of the caller's own account it may decrypt with);
-  KMS would give back the forger's data key, and the value would open to
-  a plaintext of their choosing. The AWS Encryption SDK guards against
-  the same with its strict mode. The key an alias resolved to is kept 5
-  minutes; with an alias or a bare id, `open` needs `kms:DescribeKey`
-  too, and each value refused costs one or two DescribeKey calls
-  (KMS's request quota is shared). The sealed bytes, for other code to read:
+  asked again before refusing when it was kept, so that a moved alias is
+  followed) or one of `allowed_keys` (key ARNs: an alias's previous key,
+  for values sealed before it moved). Nothing else is ever passed to
+  Decrypt. Why: a sealed value names its key, and the encryption context
+  is no secret, so anyone could seal a value under a key of their own
+  that the caller may decrypt with (another account's key whose policy
+  allows the caller's role, with `kms:Decrypt` on `*` in the caller's
+  IAM policy, or any key of the caller's own account it may decrypt
+  with); KMS would give back the forger's data key, and the value would
+  open to a plaintext of their choosing. The AWS Encryption SDK guards
+  against the same with its strict mode. The key an alias or a bare id
+  resolved to is kept 5 minutes; with an alias or a bare id, `open`
+  needs `kms:DescribeKey` too, and each value refused costs one
+  DescribeKey call (KMS's request quota is shared). The sealed bytes,
+  for other code to read:
 
   | bytes | |
   |---|---|

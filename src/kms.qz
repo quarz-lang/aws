@@ -410,9 +410,8 @@ class KMS
     data Resolution = (kms: KMS, key_id: String, arn: String, at: Duration)
 
     # How long the key an alias or a bare key id resolved to is kept
-    # before it is asked
-    # again (a moved alias is also followed at the first value it
-    # refuses).
+    # before it is asked again (a moved alias is also followed at the
+    # first value it refuses).
     RESOLVED_FOR = 5.minutes
     # The format's version byte.
     VERSION = 1
@@ -466,8 +465,9 @@ class KMS
     end
 
     # Refuses `arn` unless it is the key `key_id` names (an alias or a
-    # bare id resolved with `describe_key`, again once before refusing,
-    # so that a moved alias is followed) or one of `allowed_keys`: a
+    # bare id resolved with `describe_key`, asked again before refusing
+    # when the key came from the cache, so that a moved alias is
+    # followed) or one of `allowed_keys`: a
     # sealed value names the key to decrypt under, and one forged under
     # another key the caller may decrypt with would otherwise open, to a
     # plaintext of the forger's choosing.

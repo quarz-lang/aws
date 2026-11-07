@@ -400,12 +400,26 @@ class EnvelopeKeysTest < Test::Case
       a = AWS::KMS::Envelope.new(kms, "alias/app", ctx)
       sealed = a.seal("x")
       a.open(sealed)
-      # Another client, the same key id: not the first client's key.
-      c = a.with(kms: AWS::KMS.new(kms.config.with(region: "us-west-2")))
-      assert(!c.resolved.get.as(AWS::KMS::Envelope::Resolution).kms.equal?(c.kms))
       b = a.with(key_id: "alias/other")
       e = assert_raise(AWS::Error) { b.open(sealed) }
       assert_match(/which is not the key alias\/other points to/, e.message)
+    end
+  end
+
+  def test_a_copy_for_another_client_resolves_its_own
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      a = AWS::KMS::Envelope.new(kms, "alias/app", ctx)
+      sealed = a.seal("x")
+      a.open(sealed)
+      fake.alias_target.set(FakeKMS::OTHER_ARN)
+      # Another client: the first one's resolution (still fresh) is not
+      # its own; it asks, and the alias now names the other key.
+      c = a.with(kms: AWS::KMS.new(kms.config))
+      before = fake.seen.get.count { |t| t == "TrentService.DescribeKey" }
+      e = assert_raise(AWS::Error) { c.open(sealed) }
+      assert_match(/which is not the key alias\/app points to \(#{FakeKMS::OTHER_ARN}\)/, e.message)
+      assert_equal(before + 1, fake.seen.get.count { |t| t == "TrentService.DescribeKey" })
     end
   end
 
