@@ -400,6 +400,9 @@ class EnvelopeKeysTest < Test::Case
       a = AWS::KMS::Envelope.new(kms, "alias/app", ctx)
       sealed = a.seal("x")
       a.open(sealed)
+      # Another client, the same key id: not the first client's key.
+      c = a.with(kms: AWS::KMS.new(kms.config.with(region: "us-west-2")))
+      assert(!c.resolved.get.as(AWS::KMS::Envelope::Resolution).kms.equal?(c.kms))
       b = a.with(key_id: "alias/other")
       e = assert_raise(AWS::Error) { b.open(sealed) }
       assert_match(/which is not the key alias\/other points to/, e.message)
@@ -418,7 +421,13 @@ class EnvelopeKeysTest < Test::Case
       # Past it: asked again, the old key is no longer the alias's.
       r = box.resolved.get.as(AWS::KMS::Envelope::Resolution)
       box.resolved.set(r.with(at: r.at - 6.minutes))
+      e = assert_raise(AWS::Error) { box.open(old) }
+      assert_match(/which is not the key alias\/app points to \(#{FakeKMS::OTHER_ARN}\)/, e.message)
+      # One DescribeKey for an expired resolution, then refused.
+      before = fake.seen.get.count { |t| t == "TrentService.DescribeKey" }
+      box.resolved.set(r.with(at: r.at - 6.minutes))
       assert_raise(AWS::Error) { box.open(old) }
+      assert_equal(before + 1, fake.seen.get.count { |t| t == "TrentService.DescribeKey" })
     end
   end
 

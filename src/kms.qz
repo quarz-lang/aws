@@ -370,15 +370,16 @@ class KMS
   # kept, encrypted under the KMS key, with the ciphertext. For secrets
   # over KMS's 4 KB, and for many secrets without a KMS call each to
   # encrypt (opening one decrypts its data key through KMS). Nothing is
-  # cached but the key an alias names (`RESOLVED_FOR`).
+  # cached but the key an alias or a bare key id names (`RESOLVED_FOR`).
   #
   # A sealed value is one `Bytes`: a version byte (1); the length of the
   # KMS key's ARN (one byte) and the ARN, as `generate_data_key` gave it
   # (`open` decrypts under that key, when it accepts it: the key `key_id`
-  # names, or one of `allowed_keys`); the encrypted data key's length (two bytes, big-endian)
-  # and the key; the 12-byte nonce; then the ciphertext and its 16-byte
-  # tag. The bytes before the ciphertext are its additional
-  # authenticated data, so that none of them can be changed either.
+  # names, or one of `allowed_keys`); the encrypted data key's length
+  # (two bytes, big-endian) and the key; the 12-byte nonce; then the
+  # ciphertext and its 16-byte tag. The bytes before the ciphertext are
+  # its additional authenticated data, so that none of them can be
+  # changed either.
   #
   # ```
   # creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
@@ -399,15 +400,17 @@ class KMS
     # an alias's previous key, once it was moved).
     allowed_keys: Array[String] = Array[String].new,
     # :nodoc:
-    # What an alias or a bare key id resolved to (`describe_key`), with
-    # the key id it was for (a copy made with `with` may name another)
-    # and when.
+    # What an alias or a bare key id resolved to (`describe_key`). Not
+    # for callers: it is what `open` accepts.
     resolved: Atom[Resolution?] = Atom[Resolution?].new(nil)
   )
     # :nodoc:
-    data Resolution = (key_id: String, arn: String, at: Duration)
+    # The client, the key id it was resolved for and when (a copy made
+    # with `with` may name another client or key id). Not for callers.
+    data Resolution = (kms: KMS, key_id: String, arn: String, at: Duration)
 
-    # How long the key an alias resolved to is kept before it is asked
+    # How long the key an alias or a bare key id resolved to is kept
+    # before it is asked
     # again (a moved alias is also followed at the first value it
     # refuses).
     RESOLVED_FOR = 5.minutes
@@ -478,21 +481,21 @@ class KMS
         raise Error.new("sealed under #{arn}, which is not the key #{key_id} nor in allowed_keys")
       end
       kept = resolved.get
-      current = if kept && kept.key_id == key_id && Time.monotonic - kept.at < RESOLVED_FOR
-                  kept.arn
-                else
-                  resolve
-                end
+      fresh = kept && kept.kms.equal?(kms) && kept.key_id == key_id && Time.monotonic - kept.at < RESOLVED_FOR
+      current = fresh ? kept.as(Resolution).arn : resolve
       return if arn == current
-      current = resolve
-      return if arn == current
+      # (Kept: asked again once, for a moved alias.)
+      if fresh
+        current = resolve
+        return if arn == current
+      end
       raise Error.new("sealed under #{arn}, which is not the key #{key_id} points to (#{current}) nor in allowed_keys")
     end
 
     # The key ARN `key_id` names now.
     private def resolve -> String
       arn = kms.describe_key(key_id: key_id).arn
-      resolved.set(Resolution.new(key_id, arn, Time.monotonic))
+      resolved.set(Resolution.new(kms, key_id, arn, Time.monotonic))
       arn
     end
 

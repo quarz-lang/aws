@@ -169,14 +169,14 @@ box.open(sealed)
   sealed value names its key, and the encryption context is no secret,
   so anyone could seal a value under a key of their own that the caller
   may decrypt with (another account's key whose policy allows the
-  caller's role, with `kms:Decrypt` on `*` in the caller's IAM policy);
+  caller's role, with `kms:Decrypt` on `*` in the caller's IAM policy,
+  or any key of the caller's own account it may decrypt with);
   KMS would give back the forger's data key, and the value would open to
   a plaintext of their choosing. The AWS Encryption SDK guards against
   the same with its strict mode. The key an alias resolved to is kept 5
   minutes; with an alias or a bare id, `open` needs `kms:DescribeKey`
-  too, and each value refused costs one DescribeKey (KMS's request
-  quota is shared). The key may be in the caller's own account as well
-  as another's. The sealed bytes, for other code to read:
+  too, and each value refused costs one or two DescribeKey calls
+  (KMS's request quota is shared). The sealed bytes, for other code to read:
 
   | bytes | |
   |---|---|
