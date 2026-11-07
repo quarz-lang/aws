@@ -394,12 +394,19 @@ class KMS
     key_id: String,
     # The encryption context each data key is bound to (and must be given
     # again to open).
-    encryption_context: Hash[String, String] = Hash[String, String].new
+    encryption_context: Hash[String, String] = Hash[String, String].new,
+    # The key ARNs `open` accepts besides the one `key_id` names (that of
+    # an alias's previous key, once it was moved).
+    allowed_keys: Array[String] = Array[String].new,
+    # The key ARN an alias or a bare key id resolved to (`describe_key`).
+    resolved: Atom[String?] = Atom[String?].new(nil)
   )
     # The format's version byte.
     VERSION = 1
     # The nonce's size.
     NONCE_SIZE = 12
+    # A KMS key's ARN (not an alias's).
+    KEY_ARN = /\Aarn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key\/[A-Za-z0-9-]+\z/
 
     # `plaintext` sealed under a new data key.
     def seal(plaintext: Bytes | String) -> Bytes
@@ -414,13 +421,14 @@ class KMS
     end
 
     # The plaintext of `sealed`, its data key decrypted through KMS
-    # under the key the header names (an alias moved since does not
-    # matter).
+    # under the key the header names, when that is the key `key_id` names
+    # (an alias followed if it moved) or one of `allowed_keys`.
     #
     # ## Raises
     #
-    # `AWS::Error` for bytes that are not a sealed value of this format
-    # or were altered: `AWS::ServiceError`, a subclass, when KMS will not
+    # `AWS::Error` for bytes that are not a sealed value of this format,
+    # were altered, or name a key not accepted: `AWS::ServiceError`, a
+    # subclass, when KMS will not
     # decrypt the data key (another encryption context, an altered key
     # or ARN).
     def open(sealed: Bytes) -> Bytes
@@ -436,10 +444,40 @@ class KMS
       blob = sealed.slice(start, n)
       nonce = sealed.slice(start + n, NONCE_SIZE)
       head = sealed.slice(0, rest)
+      accept!(arn)
       key = kms.decrypt(ciphertext_blob: blob, encryption_context: encryption_context, key_id: arn).plaintext
       raise Error.new("not a sealed value: a data key of #{key.size} bytes") unless key.size == 32
       Crypto::AES::GCM.new(key).open?(nonce, sealed.slice(rest, sealed.size - rest), aad: head) ||
         raise Error.new("the sealed value was altered")
+    end
+
+    # Refuses `arn` unless it is the key `key_id` names (an alias or a
+    # bare id resolved with `describe_key`, again once before refusing,
+    # so that a moved alias is followed) or one of `allowed_keys`: a
+    # sealed value names the key to decrypt under, and one forged under
+    # another key the caller may decrypt with would otherwise open, to a
+    # plaintext of the forger's choosing.
+    private def accept!(arn: String) -> Void
+      allowed_keys.each do |k|
+        raise ArgumentError, "allowed_keys holds what is not a key ARN: #{k.inspect}" unless k.match?(KEY_ARN)
+      end
+      return if allowed_keys.include?(arn)
+      if key_id.match?(KEY_ARN)
+        return if arn == key_id
+        raise Error.new("sealed under #{arn}, which is not the key #{key_id} nor in allowed_keys")
+      end
+      current = resolved.get || resolve
+      return if arn == current
+      current = resolve
+      return if arn == current
+      raise Error.new("sealed under #{arn}, which is not the key #{key_id} points to (#{current}) nor in allowed_keys")
+    end
+
+    # The key ARN `key_id` names now.
+    private def resolve -> String
+      arn = kms.describe_key(key_id: key_id).arn
+      resolved.set(arn)
+      arn
     end
 
     # `#<AWS::KMS::Envelope alias/app>`.

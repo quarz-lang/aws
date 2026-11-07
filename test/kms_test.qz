@@ -6,13 +6,27 @@ require "test"
 # not encrypted: they say what they hold, so that `Decrypt` can check the
 # encryption context. `script` holds answers to give first (`throttle`,
 # `503`, `internal`), `offset` the fake's clock against ours.
-data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], seen: Atom[Array[String]])
+data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], seen: Atom[Array[String]], alias_target: Atom[String])
   KEY_ID = "AKIDEXAMPLE"
   SECRET = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
   ARN = "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+  # Another key: an attacker's the caller may decrypt with, or the one
+  # `alias/app` is moved to.
+  OTHER_ARN = "arn:aws:kms:us-east-1:210987654321:key/abcd1234-0000-0000-0000-000000000000"
   KEY = Crypto::RSA::PrivateKey.generate(2048)
 
-  def self.make -> FakeKMS = FakeKMS.new(Atom.new(0), Atom[Array[String]].new([]), Atom.new(0), Atom[Array[String]].new([]))
+  def self.make -> FakeKMS = FakeKMS.new(Atom.new(0), Atom[Array[String]].new([]), Atom.new(0), Atom[Array[String]].new([]), Atom.new(ARN))
+
+  # The key ARN `key` names: `alias/app` the key it points to now,
+  # `alias/other` the other key.
+  def arn_for(key: String?) -> String
+    case key
+    in "alias/app" then alias_target.get
+    in "alias/other" then OTHER_ARN
+    in String => k then k == OTHER_ARN ? OTHER_ARN : ARN
+    else ARN
+    end
+  end
 
   def handler -> HTTP::Handler
     me = self
@@ -65,24 +79,26 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
     ctx_json = ctx ? ctx.to_json : "{}"
     case target
     in "TrentService.Encrypt"
-      blob = FakeKMS.blob(ctx_json, Base64.decode(doc["Plaintext"].as_s))
-      FakeKMS.json({"CiphertextBlob" => Base64.encode(blob), "KeyId" => ARN, "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
+      arn = arn_for(key)
+      blob = FakeKMS.blob(arn, ctx_json, Base64.decode(doc["Plaintext"].as_s))
+      FakeKMS.json({"CiphertextBlob" => Base64.encode(blob), "KeyId" => arn, "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
     in "TrentService.Decrypt"
-      # (As KMS: a KeyId given must be the key the blob is under.)
-      if key && key != ARN
-        return FakeKMS.error(400, "IncorrectKeyException", "", now)
-      end
       blob = Base64.decode(doc["CiphertextBlob"].as_s)
       text = blob.decode? || ""
-      parts = text.split("|", 3)
-      if parts.size != 3 || parts[0] != "fakeblob" || parts[1] != ctx_json
+      parts = text.split("|", 4)
+      if parts.size != 4 || parts[0] != "fakeblob" || parts[2] != ctx_json
         return FakeKMS.error(400, "InvalidCiphertextException", "", now)
       end
-      FakeKMS.json({"Plaintext" => parts[2], "KeyId" => ARN, "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
+      # (As KMS: a KeyId given must be the key the blob is under.)
+      if key && arn_for(key) != parts[1]
+        return FakeKMS.error(400, "IncorrectKeyException", "", now)
+      end
+      FakeKMS.json({"Plaintext" => parts[3], "KeyId" => parts[1], "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
     in "TrentService.GenerateDataKey" | "TrentService.GenerateDataKeyWithoutPlaintext"
       size = doc["NumberOfBytes"]?&.as_i? || (doc["KeySpec"]?&.as_s? == "AES_128" ? 16 : 32)
       plain = Crypto.random_bytes(size)
-      out = {"CiphertextBlob" => Base64.encode(FakeKMS.blob(ctx_json, plain)), "KeyId" => ARN}
+      arn = arn_for(key)
+      out = {"CiphertextBlob" => Base64.encode(FakeKMS.blob(arn, ctx_json, plain)), "KeyId" => arn}
       out = out.merge({"Plaintext" => Base64.encode(plain)}) if target == "TrentService.GenerateDataKey"
       FakeKMS.json(out)
     in "TrentService.Sign"
@@ -97,7 +113,7 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
       FakeKMS.json({"PublicKey" => Base64.encode(KEY.public_key.to_der), "KeyId" => ARN, "KeySpec" => "RSA_2048", "KeyUsage" => "SIGN_VERIFY",
                     "SigningAlgorithms" => ["RSASSA_PKCS1_V1_5_SHA_256", "RSASSA_PSS_SHA_256"]})
     in "TrentService.DescribeKey"
-      FakeKMS.json({"KeyMetadata" => {"KeyId" => "1234abcd-12ab-34cd-56ef-1234567890ab", "Arn" => ARN, "KeySpec" => "SYMMETRIC_DEFAULT",
+      FakeKMS.json({"KeyMetadata" => {"KeyId" => "1234abcd-12ab-34cd-56ef-1234567890ab", "Arn" => arn_for(key), "KeySpec" => "SYMMETRIC_DEFAULT",
                                       "KeyUsage" => "ENCRYPT_DECRYPT", "Enabled" => true, "KeyState" => "Enabled", "Description" => "test key",
                                       "CreationDate" => 1.7e9}})
     in "TrentService.GenerateRandom"
@@ -107,7 +123,7 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
     end
   end
 
-  def self.blob(ctx: String, plain: Bytes) -> Bytes = "fakeblob|#{ctx}|#{Base64.encode(plain)}".to_bytes
+  def self.blob(arn: String, ctx: String, plain: Bytes) -> Bytes = "fakeblob|#{arn}|#{ctx}|#{Base64.encode(plain)}".to_bytes
 
   def self.json(value: Object) -> HTTP::Server::Response
     HTTP::Server::Response.text(JSON.generate(value)).header("Content-Type", "application/x-amz-json-1.1").header("x-amzn-RequestId", "req-1")
@@ -335,6 +351,54 @@ class KMSTest < Test::Case
     assert_equal(Time.utc(2026, 11, 7, 12, 0, 1), AWS::KMS.http_date("Sat, 07 Nov 2026 12:00:01 GMT"))
     assert_nil(AWS::KMS.http_date("yesterday"))
     assert_nil(AWS::KMS.http_date(nil))
+  end
+end
+
+class EnvelopeKeysTest < Test::Case
+  def ctx -> Hash[String, String] = {"tenant" => "t1"}
+
+  # A value forged under another key the caller may decrypt with (the
+  # same encryption context, which is no secret) is refused before KMS
+  # is asked to decrypt it.
+  def test_a_value_forged_under_another_key
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      forged = AWS::KMS::Envelope.new(kms, "alias/other", ctx).seal("the forger's words")
+      box = AWS::KMS::Envelope.new(kms, "alias/app", ctx)
+      e = assert_raise(AWS::Error) { box.open(forged) }
+      assert_equal("sealed under #{FakeKMS::OTHER_ARN}, which is not the key alias/app points to (#{FakeKMS::ARN}) nor in allowed_keys", e.message)
+      assert(!fake.seen.get.include?("TrentService.Decrypt"))
+      pinned = AWS::KMS::Envelope.new(kms, FakeKMS::ARN, ctx)
+      e = assert_raise(AWS::Error) { pinned.open(forged) }
+      assert_equal("sealed under #{FakeKMS::OTHER_ARN}, which is not the key #{FakeKMS::ARN} nor in allowed_keys", e.message)
+      assert_equal("the forger's words".to_bytes, AWS::KMS::Envelope.new(kms, "alias/app", ctx, [FakeKMS::OTHER_ARN]).open(forged))
+    end
+  end
+
+  # An alias moved to another key: new values under the new key open
+  # (resolved again), old ones with the old key in allowed_keys.
+  def test_an_alias_moved
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      box = AWS::KMS::Envelope.new(kms, "alias/app", ctx)
+      old = box.seal("before")
+      assert_equal("before".to_bytes, box.open(old))
+      fake.alias_target.set(FakeKMS::OTHER_ARN)
+      fresh = box.seal("after")
+      assert_equal("after".to_bytes, box.open(fresh))
+      e = assert_raise(AWS::Error) { box.open(old) }
+      assert_match(/\Asealed under #{FakeKMS::ARN}, which is not the key alias\/app points to \(#{FakeKMS::OTHER_ARN}\)/, e.message)
+      both = AWS::KMS::Envelope.new(kms, "alias/app", ctx, [FakeKMS::ARN])
+      assert_equal("before".to_bytes, both.open(old))
+      assert_equal("after".to_bytes, both.open(fresh))
+    end
+  end
+
+  def test_allowed_keys_are_key_arns
+    KMSFakes.with(FakeKMS.make) do |kms|
+      sealed = AWS::KMS::Envelope.new(kms, "alias/app", ctx).seal("x")
+      assert_raise(ArgumentError) { AWS::KMS::Envelope.new(kms, "alias/app", ctx, ["alias/old"]).open(sealed) }
+    end
   end
 end
 

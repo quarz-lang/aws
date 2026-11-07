@@ -157,12 +157,23 @@ box.open(sealed)
 - Requests follow no redirect (`Config.client`, the default): a
   redirect would take the body (a plaintext) elsewhere. The region must
   be a host label.
-- `KMS::Envelope`: each `seal` makes a data key (`generate_data_key`,
-  bound to the encryption context) and encrypts with AES-256-GCM.
-  `open` decrypts the data key through KMS under the key ARN the sealed
-  value names (so that an alias moved to another key since does not
-  matter), with the same encryption context. Nothing is cached. The
-  sealed bytes, for other code to read:
+- `KMS::Envelope.new(kms, key_id, encryption_context, allowed_keys = [])`:
+  each `seal` makes a data key (`generate_data_key`, bound to the
+  encryption context) and encrypts with AES-256-GCM. `open` decrypts the
+  data key through KMS under the key ARN the sealed value names, with
+  the same encryption context, but only when that ARN is the key
+  `key_id` names (an alias or a bare id resolved with `describe_key`,
+  again once before refusing, so that a moved alias is followed) or one
+  of `allowed_keys` (key ARNs: an alias's previous key, for values sealed
+  before it moved). Nothing else is ever passed to Decrypt. Why: a
+  sealed value names its key, and the encryption context is no secret,
+  so anyone could seal a value under a key of their own that the caller
+  may decrypt with (another account's key whose policy allows the
+  caller's role, with `kms:Decrypt` on `*` in the caller's IAM policy);
+  KMS would give back the forger's data key, and the value would open to
+  a plaintext of their choosing. The AWS Encryption SDK guards against
+  the same with its strict mode. Nothing is cached but the key an alias
+  resolved to. The sealed bytes, for other code to read:
 
   | bytes | |
   |---|---|
