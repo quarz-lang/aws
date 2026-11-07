@@ -1,0 +1,176 @@
+# The shared configuration files the SDKs and the CLI read:
+# `~/.aws/credentials` (AWS_SHARED_CREDENTIALS_FILE), whose sections
+# are profile names, and `~/.aws/config` (AWS_CONFIG_FILE), whose
+# sections are `[default]` and `[profile name]`. A profile's settings
+# are both files' merged, the credentials file's winning.
+#
+# ```
+# AWS::Profiles.parse("[default]\nregion = eu-west-1\n# a comment\n", false)
+# # => {"default" => {"region" => "eu-west-1"}}
+# AWS::Profiles.parse("[profile dev]\nregion=us-east-2\n", true)
+# # => {"dev" => {"region" => "us-east-2"}}
+# ```
+module Profiles
+  # The settings of profile `name`, nil when neither file has it (`env`
+  # gives the files' paths and HOME). Raises `CredentialsError` for a
+  # file that cannot be read.
+  def self.settings(name: String, env: Hash[String, String] = ENV) -> Hash[String, String]?
+    config = Profiles.read(Profiles.config_path(env), true)[name]?
+    creds = Profiles.read(Profiles.credentials_path(env), false)[name]?
+    return nil if config.nil? && creds.nil?
+    (config || {}).merge(creds || {})
+  end
+
+  # The region of profile `name` (AWS_PROFILE, else `default`), nil
+  # when it has none. Raises `CredentialsError` as `.settings` does.
+  def self.region(name: String? = nil, env: Hash[String, String] = ENV) -> String?
+    p = env["AWS_PROFILE"]?
+    s = Profiles.settings(name || (p && !p.empty? ? p : nil) || "default", env)
+    s ? s["region"]? : nil
+  end
+
+  # :nodoc:
+  def self.credentials_path(env: Hash[String, String]) -> String
+    env["AWS_SHARED_CREDENTIALS_FILE"]? || "#{Profiles.home(env)}/.aws/credentials"
+  end
+
+  # :nodoc:
+  def self.config_path(env: Hash[String, String]) -> String
+    env["AWS_CONFIG_FILE"]? || "#{Profiles.home(env)}/.aws/config"
+  end
+
+  # :nodoc:
+  def self.home(env: Hash[String, String]) -> String = env["HOME"]? || ""
+
+  # :nodoc:
+  # The profiles of the file at `path`, none when it does not exist.
+  def self.read(path: String, config: Bool) -> Hash[String, Hash[String, String]]
+    return {} unless File.file?(path)
+    text = begin
+             File.read(path)
+           rescue StandardError => e
+             raise CredentialsError.new("cannot read #{path} (#{e.class.name})")
+           end
+    Profiles.parse(text, config)
+  end
+
+  # The profiles of an INI text: `[section]` lines (a comment may follow
+  # them), `name = value` lines under them (names lowercased, values
+  # trimmed), `#` and `;` comment lines. A line indented deeper than the
+  # setting above it continues it or is one of its sub-settings (`s3 =`
+  # then `  addressing_style = path`): not a setting of the profile, as
+  # configparser reads it. In a
+  # config file (`config`), `[profile name]` is profile `name` and a
+  # section of another form but `[default]` is not a profile.
+  def self.parse(text: String, config: Bool) -> Hash[String, Hash[String, String]]
+    out = Hash::Builder[String, Hash[String, String]].new
+    current: String? = nil
+    # (The indentation of the last setting: a line deeper is its
+    # continuation or sub-setting.)
+    last_indent: Int? = nil
+    text.split("\n").each do |raw|
+      line = raw.strip
+      next if line.empty? || line.start_with?("#") || line.start_with?(";")
+      indent = raw.size - raw.lstrip.size
+      if li = last_indent
+        next if indent > li
+      end
+      if line.start_with?("[")
+        m = line.match(/\A\[([^\]]*)\]\s*(?:[#;].*)?\z/)
+        last_indent = nil
+        # (A malformed header: what follows is no profile's.)
+        if m.nil?
+          current = nil
+          next
+        end
+        section = m[1].as(String).strip
+        current = if !config || section == "default"
+                    section
+                  elsif section.start_with?("profile ")
+                    section[8, section.size - 8].strip
+                  else
+                    nil
+                  end
+        if c = current
+          out[c] = out[c]? || {}
+        end
+        next
+      end
+      last_indent = indent
+      c = current
+      next if c.nil?
+      k, eq, v = line.partition("=")
+      next if eq.empty?
+      out[c] = (out[c]? || {}).merge({k.strip.downcase => v.strip})
+    end
+    out.to_h
+  end
+
+  # :nodoc:
+  # The keys a profile's settings give, nil without both.
+  def self.keys(s: Hash[String, String]) -> Credentials::Keys?
+    id = s["aws_access_key_id"]?
+    secret = s["aws_secret_access_key"]?
+    return nil if id.nil? || id.empty? || secret.nil? || secret.empty?
+    token = s["aws_session_token"]?
+    Credentials::Keys.new(id, secret, token && !token.empty? ? token : nil, nil)
+  end
+end
+
+# :nodoc:
+# The two STS calls the credentials providers make (`AssumeRole`,
+# `AssumeRoleWithWebIdentity`): the Query protocol, a form POSTed, the
+# keys read from the XML answer (`STSXML`).
+module STS
+  # The endpoint: `AWS_ENDPOINT_URL_STS` or `AWS_ENDPOINT_URL`, else the
+  # regional one for `region`, the global one without.
+  def self.endpoint(region: String?, env: Hash[String, String]) -> String
+    if e = env["AWS_ENDPOINT_URL_STS"]? || env["AWS_ENDPOINT_URL"]?
+      return e
+    end
+    return "https://sts.amazonaws.com/" if region.nil?
+    # (A region is a host label: it names the host the token goes to.)
+    raise CredentialsError.new("not a region: #{region.inspect}") unless region.match?(/\A[a-z0-9]+(-[a-z0-9]+)*\z/)
+    "https://sts.#{region}.amazonaws.com/"
+  end
+
+  # A session name for a role whose settings give none.
+  def self.session_name -> String = "quarz-#{Time.now.to_i}"
+
+  # The temporary keys of `params`' call at `url`, signed with `keys`
+  # when given (for `region`, `us-east-1` without one), read from the
+  # `result` element of the answer.
+  def self.assume(http: HTTP::Client, url: String, params: Hash[String, String], result: String,
+                  keys: Credentials::Keys?, region: String?) -> Credentials::Keys
+    req = HTTP::Client::Request.post(url, body: params.map { |k, v| "#{URI.encode(k, true)}=#{URI.encode(v, true)}" }.join("&"),
+                                     content_type: "application/x-www-form-urlencoded; charset=utf-8")
+    if k = keys
+      req = SigV4.sign(req, service: "sts", region: region || "us-east-1", credentials: k)
+    end
+    action = params["Action"]
+    status, body = begin
+                     res = http.request(req)
+                     [res.status, res.body.read]
+                   rescue HTTP::Client::Error => e
+                     raise CredentialsError.new("STS #{action} could not be reached (#{e.class.name}: #{e.message})")
+                   end
+    unless status >= 200 && status <= 299
+      f: Hash[String, String] = begin
+                                  STSXML.fields(body, ["Code", "Message"])
+                                rescue CredentialsError
+                                  {}
+                                end
+      raise CredentialsError.new("STS #{action} answered #{status}#{f["Code"]? ? ": #{f["Code"]}" : ""}#{f["Message"]? ? " (#{f["Message"]})" : ""}")
+    end
+    # (The keys under the result's `Credentials` only.)
+    f = STSXML.fields(body, ["AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"], [result, "Credentials"])
+    id = f["AccessKeyId"]?
+    secret = f["SecretAccessKey"]?
+    token = f["SessionToken"]?
+    exp = f["Expiration"]?
+    if id.nil? || secret.nil? || token.nil? || exp.nil? || id.empty? || secret.empty?
+      raise CredentialsError.new("STS #{action} answered without the keys")
+    end
+    Credentials::Keys.new(id, secret, token, Credentials.time(exp, "STS #{action}"))
+  end
+end
