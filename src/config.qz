@@ -1,0 +1,73 @@
+require "http"
+require "uri"
+
+# What a service client needs: the region, the credentials, where to
+# send requests, the HTTP client, and the retry rules.
+#
+# ```
+# creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+# config = AWS::Config.new(region: "ap-northeast-1", credentials: creds)
+# config.endpoint_for("kms").to_s   # => "https://kms.ap-northeast-1.amazonaws.com"
+# ```
+data Config(
+  # The region: `ap-northeast-1`.
+  region: String,
+  # Where the keys come from.
+  credentials: Credentials::Provider,
+  # Where to send every service's requests (a local emulator), nil for
+  # AWS's endpoints.
+  endpoint: URI? = nil,
+  # The client the requests go through.
+  http: HTTP::Client = HTTP::Client.default,
+  # How many times a request is tried again after a failure that may
+  # pass: throttling, a 5xx, a transport error.
+  retries: Int = 3,
+  # The longest one attempt may take.
+  timeout: Duration = 30.seconds,
+  # The backoff before the n-th retry is a random time up to
+  # `min(retry_cap, retry_base * 2**n)` (full jitter).
+  retry_base: Duration = 100.milliseconds,
+  # The longest backoff.
+  retry_cap: Duration = 20.seconds,
+  # Endpoints for one service each (`kms` => URI), before `endpoint`:
+  # what AWS_ENDPOINT_URL_KMS gives.
+  service_endpoints: Hash[String, URI] = Hash[String, URI].new
+)
+  # The configuration of the environment: the region of AWS_REGION,
+  # AWS_DEFAULT_REGION or the profile's `region`, the credentials of
+  # `Credentials.default`, the endpoints of AWS_ENDPOINT_URL and
+  # AWS_ENDPOINT_URL_<SERVICE> (KMS: AWS_ENDPOINT_URL_KMS).
+  #
+  # ## Raises
+  #
+  # `AWS::Error` when no region is set, `ArgumentError` for an endpoint
+  # that is not a URL.
+  def self.default(env: Hash[String, String] = ENV) -> Config
+    region = Config.nonempty(env["AWS_REGION"]?) || Config.nonempty(env["AWS_DEFAULT_REGION"]?) || Profiles.region(nil, env)
+    raise Error.new("no region: set AWS_REGION, or a region in the profile") if region.nil? || region.empty?
+    general = Config.nonempty(env["AWS_ENDPOINT_URL"]?)
+    services = Hash::Builder[String, URI].new
+    env.each do |k, v|
+      if k.start_with?("AWS_ENDPOINT_URL_") && !v.empty?
+        services[k[17, k.size - 17].downcase] = URI.parse(v)
+      end
+    end
+    Config.new(region, Credentials.default(env), general ? URI.parse(general) : nil, HTTP::Client.default, 3, 30.seconds,
+               100.milliseconds, 20.seconds, services.to_h)
+  end
+
+  # :nodoc:
+  def self.nonempty(s: String?) -> String? = s && !s.empty? ? s : nil
+
+  # Where `service`'s requests go (`kms`): its own endpoint, else
+  # `endpoint`, else `https://<service>.<region>.amazonaws.com`.
+  def endpoint_for(service: String) -> URI
+    service_endpoints[service.downcase]? || endpoint || URI.parse("https://#{service}.#{region}.amazonaws.com")
+  end
+
+  # `#<AWS::Config ap-northeast-1>`: not the credentials' state.
+  def inspect -> String = "#<AWS::Config #{region}>"
+
+  # As `inspect`.
+  def to_s -> String = inspect
+end

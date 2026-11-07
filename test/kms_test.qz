@@ -1,0 +1,299 @@
+require "test"
+
+# A fake KMS: it checks each request as KMS would (the SigV4 signature
+# recomputed with the test keys, `X-Amz-Target`, the content type, the
+# JSON body) and answers as KMS's JSON 1.1 protocol does. Its blobs are
+# not encrypted: they say what they hold, so that `Decrypt` can check the
+# encryption context. `script` holds answers to give first (`throttle`,
+# `503`, `internal`), `offset` the fake's clock against ours.
+data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], seen: Atom[Array[String]])
+  KEY_ID = "AKIDEXAMPLE"
+  SECRET = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+  ARN = "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+  KEY = Crypto::RSA::PrivateKey.generate(2048)
+
+  def self.make -> FakeKMS = FakeKMS.new(Atom.new(0), Atom[Array[String]].new([]), Atom.new(0), Atom[Array[String]].new([]))
+
+  def handler -> HTTP::Handler
+    me = self
+    HTTP.handler { |req| me.answer(req) }
+  end
+
+  def answer(req: HTTP::Server::Request) -> HTTP::Server::Response
+    calls.update { |c| c + 1 }
+    body = req.body.read
+    target = req.headers["x-amz-target"] || ""
+    seen.update { |s| s + [target] }
+    now = Time.now + offset.get.milliseconds
+    d = req.headers["x-amz-date"] || ""
+    if d.size == 16
+      t = Time.utc(d[0, 4].to_i, d[4, 2].to_i, d[6, 2].to_i, d[9, 2].to_i, d[11, 2].to_i, d[13, 2].to_i)
+      if (t - now).to_ms.abs > 300_000
+        return FakeKMS.error(400, "InvalidSignatureException", "Signature expired: #{d} is now earlier than #{now.utc.strftime("%Y%m%dT%H%M%SZ")}",
+                             now)
+      end
+    end
+    unless FakeKMS.signed?(req, body) && req.headers["content-type"] == AWS::KMS::CONTENT_TYPE && req.method == "POST" && req.path == "/"
+      return FakeKMS.error(400, "InvalidSignatureException", "The request signature we calculated does not match", now)
+    end
+    queued = script.get
+    unless queued.empty?
+      script.set(queued.drop(1))
+      case queued[0]
+      in "throttle" then return FakeKMS.error(400, "ThrottlingException", "Rate exceeded", now)
+      in "503" then return HTTP::Server::Response.text("", 503)
+      in "internal" then return FakeKMS.error(500, "KMSInternalException", "oops", now)
+      else nil
+      end
+    end
+    doc = JSON.parse(body)
+    key = doc["KeyId"]?&.as_s?
+    return FakeKMS.error(400, "NotFoundException", "Key '#{key}' does not exist", now) if key == "alias/missing"
+    if key == "alias/denied"
+      return HTTP::Server::Response.text("{\"message\":\"not allowed\"}", 400).header("x-amzn-ErrorType", "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/")
+                                                                       .header("x-amzn-RequestId", "req-denied")
+    end
+    ctx = doc["EncryptionContext"]?
+    ctx_json = ctx ? ctx.to_json : "{}"
+    case target
+    in "TrentService.Encrypt"
+      blob = FakeKMS.blob(ctx_json, Base64.decode(doc["Plaintext"].as_s))
+      FakeKMS.json({"CiphertextBlob" => Base64.encode(blob), "KeyId" => ARN, "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
+    in "TrentService.Decrypt"
+      blob = Base64.decode(doc["CiphertextBlob"].as_s)
+      text = blob.decode? || ""
+      parts = text.split("|", 3)
+      if parts.size != 3 || parts[0] != "fakeblob" || parts[1] != ctx_json
+        return FakeKMS.error(400, "InvalidCiphertextException", "", now)
+      end
+      FakeKMS.json({"Plaintext" => parts[2], "KeyId" => ARN, "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
+    in "TrentService.GenerateDataKey" | "TrentService.GenerateDataKeyWithoutPlaintext"
+      size = doc["NumberOfBytes"]?&.as_i? || (doc["KeySpec"]?&.as_s? == "AES_128" ? 16 : 32)
+      plain = Crypto.random_bytes(size)
+      out = {"CiphertextBlob" => Base64.encode(FakeKMS.blob(ctx_json, plain)), "KeyId" => ARN}
+      out = out.merge({"Plaintext" => Base64.encode(plain)}) if target == "TrentService.GenerateDataKey"
+      FakeKMS.json(out)
+    in "TrentService.Sign"
+      raise "expected RSASSA_PKCS1_V1_5_SHA_256" unless doc["SigningAlgorithm"].as_s == "RSASSA_PKCS1_V1_5_SHA_256" && doc["MessageType"].as_s == "RAW"
+      sig = KEY.sign(Base64.decode(doc["Message"].as_s), :sha256)
+      FakeKMS.json({"Signature" => Base64.encode(sig), "KeyId" => ARN, "SigningAlgorithm" => "RSASSA_PKCS1_V1_5_SHA_256"})
+    in "TrentService.Verify"
+      ok = KEY.public_key.verify(Base64.decode(doc["Message"].as_s), Base64.decode(doc["Signature"].as_s), :sha256)
+      return FakeKMS.error(400, "KMSInvalidSignatureException", "", now) unless ok
+      FakeKMS.json({"SignatureValid" => true, "KeyId" => ARN, "SigningAlgorithm" => "RSASSA_PKCS1_V1_5_SHA_256"})
+    in "TrentService.GetPublicKey"
+      FakeKMS.json({"PublicKey" => Base64.encode(KEY.public_key.to_der), "KeyId" => ARN, "KeySpec" => "RSA_2048", "KeyUsage" => "SIGN_VERIFY",
+                    "SigningAlgorithms" => ["RSASSA_PKCS1_V1_5_SHA_256", "RSASSA_PSS_SHA_256"]})
+    in "TrentService.DescribeKey"
+      FakeKMS.json({"KeyMetadata" => {"KeyId" => "1234abcd-12ab-34cd-56ef-1234567890ab", "Arn" => ARN, "KeySpec" => "SYMMETRIC_DEFAULT",
+                                      "KeyUsage" => "ENCRYPT_DECRYPT", "Enabled" => true, "KeyState" => "Enabled", "Description" => "test key",
+                                      "CreationDate" => 1.7e9}})
+    in "TrentService.GenerateRandom"
+      FakeKMS.json({"Plaintext" => Base64.encode(Crypto.random_bytes(doc["NumberOfBytes"].as_i))})
+    else
+      FakeKMS.error(400, "UnknownOperationException", "", now)
+    end
+  end
+
+  def self.blob(ctx: String, plain: Bytes) -> Bytes = "fakeblob|#{ctx}|#{Base64.encode(plain)}".to_bytes
+
+  def self.json(value: Object) -> HTTP::Server::Response
+    HTTP::Server::Response.text(JSON.generate(value)).header("Content-Type", "application/x-amz-json-1.1").header("x-amzn-RequestId", "req-1")
+  end
+
+  def self.error(status: Int, code: String, message: String, now: Time) -> HTTP::Server::Response
+    HTTP::Server::Response.text(JSON.generate({"__type" => "com.amazonaws.kms##{code}", "message" => message}), status)
+                          .header("Content-Type", "application/x-amz-json-1.1").header("x-amzn-RequestId", "req-err")
+                          .header("Date", now.utc.strftime("%a, %d %b %Y %H:%M:%S GMT"))
+  end
+
+  # Whether the request carries a SigV4 signature for `kms` in us-east-1
+  # with the test keys, recomputed over what was received.
+  def self.signed?(req: HTTP::Server::Request, body: String) -> Bool
+    auth = req.headers["authorization"] || return false
+    m = auth.match(/\AAWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/(\d{8})\/us-east-1\/kms\/aws4_request, SignedHeaders=([^,]+), Signature=([0-9a-f]{64})\z/)
+    return false if m.nil?
+    names = m[2].as(String).split(";")
+    return false unless names.include?("host") && names.include?("x-amz-date") && names.include?("x-amz-target")
+    headers = HTTP::Headers.empty
+    names.each { |n| req.headers.all(n).each { |v| headers = headers.add(n, v) } }
+    d = req.headers["x-amz-date"] || return false
+    t = Time.utc(d[0, 4].to_i, d[4, 2].to_i, d[6, 2].to_i, d[9, 2].to_i, d[11, 2].to_i, d[13, 2].to_i)
+    url = URI.parse("http://#{req.headers["host"]}#{req.target}")
+    keys = AWS::Credentials::Keys.new(KEY_ID, SECRET)
+    parts = AWS::SigV4.parts(req.method, url, headers, Digest::SHA256.hexdigest(body), service: "kms", region: "us-east-1",
+                             credentials: keys, time: t)
+    parts.signature == m[3]
+  end
+end
+
+module KMSFakes
+  # A client of a fake KMS while the block runs.
+  def self.with(fake: FakeKMS, retries: Int = 3, &: (AWS::KMS) -> Void) -> Void
+    server = HTTP::Server.new(fake.handler, host: "127.0.0.1", port: 0)
+    Task.scope do |scope|
+      scope.spawn { server.serve }
+      begin
+        creds = AWS::Credentials.static(access_key_id: FakeKMS::KEY_ID, secret_access_key: FakeKMS::SECRET)
+        config = AWS::Config.new(region: "us-east-1", credentials: creds, endpoint: URI.parse("http://127.0.0.1:#{server.local_address.port}"),
+                                 http: HTTP::Client.new(proxy: nil), retries: retries, timeout: 5.seconds,
+                                 retry_base: 1.milliseconds, retry_cap: 4.milliseconds)
+        yield AWS::KMS.new(config)
+      ensure
+        server.shutdown
+      end
+    end
+    nil
+  end
+end
+
+class KMSTest < Test::Case
+  def ctx -> Hash[String, String] = {"tenant" => "t1"}
+
+  def test_encrypt_and_decrypt
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      out = kms.encrypt(key_id: "alias/app", plaintext: "secret", encryption_context: ctx)
+      assert_equal(FakeKMS::ARN, out.key_id)
+      assert_equal("SYMMETRIC_DEFAULT", out.encryption_algorithm)
+      back = kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: ctx)
+      assert_equal(b"secret", back.plaintext)
+      assert(!back.inspect.include?("secret"))
+      e = assert_raise(AWS::ServiceError) { kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: {"tenant" => "t2"}) }.as(AWS::ServiceError)
+      assert_equal("InvalidCiphertextException", e.code)
+      assert_equal(400, e.status)
+      assert_equal(["TrentService.Encrypt", "TrentService.Decrypt", "TrentService.Decrypt"], fake.seen.get)
+    end
+  end
+
+  def test_data_keys_and_random
+    KMSFakes.with(FakeKMS.make) do |kms|
+      dk = kms.generate_data_key(key_id: "alias/app", encryption_context: ctx)
+      assert_equal(32, dk.plaintext.size)
+      assert_equal(dk.plaintext, kms.decrypt(ciphertext_blob: dk.ciphertext_blob, encryption_context: ctx).plaintext)
+      assert_equal("#<AWS::KMS::DataKey #{FakeKMS::ARN}>", dk.inspect)
+      assert_equal(16, kms.generate_data_key(key_id: "alias/app", key_spec: :aes_128).plaintext.size)
+      assert_equal(64, kms.generate_data_key(key_id: "alias/app", number_of_bytes: 64).plaintext.size)
+      wo = kms.generate_data_key_without_plaintext(key_id: "alias/app")
+      assert_equal(32, kms.decrypt(ciphertext_blob: wo.ciphertext_blob).plaintext.size)
+      assert_equal(24, kms.generate_random(number_of_bytes: 24).plaintext.size)
+    end
+  end
+
+  def test_sign_verify_and_public_key
+    KMSFakes.with(FakeKMS.make) do |kms|
+      sig = kms.sign(key_id: "alias/sign", message: "hello", signing_algorithm: :rsassa_pkcs1_v1_5_sha_256).signature
+      assert(kms.verify(key_id: "alias/sign", message: "hello", signature: sig, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256))
+      assert(!kms.verify(key_id: "alias/sign", message: "other", signature: sig, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256))
+      pub = kms.get_public_key(key_id: "alias/sign")
+      assert_equal("RSA_2048", pub.key_spec)
+      assert_equal(["RSASSA_PKCS1_V1_5_SHA_256", "RSASSA_PSS_SHA_256"], pub.signing_algorithms)
+      assert(Crypto::RSA::PublicKey.from_der(pub.public_key).verify("hello", sig, :sha256))
+    end
+  end
+
+  def test_describe_key
+    KMSFakes.with(FakeKMS.make) do |kms|
+      m = kms.describe_key(key_id: "alias/app")
+      assert_equal(FakeKMS::ARN, m.arn)
+      assert_equal("ENCRYPT_DECRYPT", m.key_usage)
+      assert(m.enabled?)
+      assert_equal("Enabled", m.key_state)
+    end
+  end
+
+  def test_errors
+    KMSFakes.with(FakeKMS.make) do |kms|
+      e = assert_raise(AWS::ServiceError) { kms.describe_key(key_id: "alias/missing") }.as(AWS::ServiceError)
+      assert_equal("NotFoundException", e.code)
+      assert_equal("Key 'alias/missing' does not exist", e.detail)
+      assert_equal("req-err", e.request_id)
+      assert_equal("NotFoundException: Key 'alias/missing' does not exist (400, request req-err)", e.message)
+      e = assert_raise(AWS::ServiceError) { kms.encrypt(key_id: "alias/denied", plaintext: "TOPSECRET") }.as(AWS::ServiceError)
+      assert_equal("AccessDeniedException", e.code)
+      assert_equal("req-denied", e.request_id)
+      assert(!e.message.include?("TOPSECRET"))
+    end
+  end
+
+  def test_throttling_then_success
+    fake = FakeKMS.make
+    fake.script.set(["throttle", "503", "internal"])
+    KMSFakes.with(fake) do |kms|
+      assert_equal(FakeKMS::ARN, kms.encrypt(key_id: "alias/app", plaintext: "x").key_id)
+      assert_equal(4, fake.calls.get)
+    end
+  end
+
+  def test_retries_run_out
+    fake = FakeKMS.make
+    fake.script.set(["503", "503", "503"])
+    KMSFakes.with(fake, 2) do |kms|
+      e = assert_raise(AWS::ServiceError) { kms.encrypt(key_id: "alias/app", plaintext: "x") }.as(AWS::ServiceError)
+      assert_equal(503, e.status)
+      assert_equal("HTTP503", e.code)
+      assert_equal(3, fake.calls.get)
+    end
+  end
+
+  def test_clock_skew_is_corrected_once
+    fake = FakeKMS.make
+    fake.offset.set(3_600_000)
+    KMSFakes.with(fake) do |kms|
+      assert_equal(FakeKMS::ARN, kms.encrypt(key_id: "alias/app", plaintext: "x").key_id)
+      assert_equal(2, fake.calls.get)
+      # Kept for the next requests.
+      kms.encrypt(key_id: "alias/app", plaintext: "x")
+      assert_equal(3, fake.calls.get)
+    end
+  end
+
+  def test_transport_error
+    creds = AWS::Credentials.static(access_key_id: FakeKMS::KEY_ID, secret_access_key: FakeKMS::SECRET)
+    config = AWS::Config.new(region: "us-east-1", credentials: creds, endpoint: URI.parse("http://127.0.0.1:1"),
+                             http: HTTP::Client.new(proxy: nil), retries: 2, timeout: 5.seconds, retry_base: 1.milliseconds, retry_cap: 2.milliseconds)
+    e = assert_raise(AWS::TransportError) { AWS::KMS.new(config).encrypt(key_id: "k", plaintext: "x") }
+    assert_match(/\AKMS Encrypt: HTTP::Client::ConnectError: /, e.message)
+  end
+
+  def test_config
+    creds = AWS::Credentials.static(access_key_id: "a", secret_access_key: "s")
+    assert_equal("https://kms.eu-west-1.amazonaws.com", AWS::Config.new(region: "eu-west-1", credentials: creds).endpoint_for("kms").to_s)
+    env = {"AWS_REGION" => "ap-northeast-1", "AWS_ENDPOINT_URL_KMS" => "http://localhost:4566", "AWS_EC2_METADATA_DISABLED" => "true", "HOME" => "/nonexistent"}
+    c = AWS::Config.default(env)
+    assert_equal("ap-northeast-1", c.region)
+    assert_equal("http://localhost:4566", c.endpoint_for("kms").to_s)
+    assert_equal("https://sqs.ap-northeast-1.amazonaws.com", c.endpoint_for("sqs").to_s)
+    assert_equal("#<AWS::Config ap-northeast-1>", c.inspect)
+    assert_raise(AWS::Error) { AWS::Config.default({"HOME" => "/nonexistent"}) }
+  end
+
+  def test_http_date
+    assert_equal(Time.utc(2026, 11, 7, 12, 0, 1), AWS::KMS.http_date("Sat, 07 Nov 2026 12:00:01 GMT"))
+    assert_nil(AWS::KMS.http_date("yesterday"))
+    assert_nil(AWS::KMS.http_date(nil))
+  end
+end
+
+class EnvelopeTest < Test::Case
+  def test_round_trip_and_tampering
+    KMSFakes.with(FakeKMS.make) do |kms|
+      box = AWS::KMS::Envelope.new(kms, "alias/app", {"tenant" => "t1"})
+      big = "x" * 10_000
+      sealed = box.seal(big)
+      assert_equal(1, sealed[0])
+      assert_equal(big.to_bytes, box.open(sealed))
+      assert(box.seal(big) != sealed)
+      # Each byte of the head and the body is protected.
+      [0, 5, sealed.size - 20, sealed.size - 1].each do |i|
+        altered = sealed.slice(0, i) + Bytes[(sealed[i] + 1) % 256] + sealed.slice(i + 1, sealed.size - i - 1)
+        assert_raise(AWS::Error) { box.open(altered) }
+      end
+      assert_raise(AWS::Error) { box.open(Bytes[1, 0]) }
+      # Another context: KMS refuses the data key.
+      other = AWS::KMS::Envelope.new(kms, "alias/app", {"tenant" => "t2"})
+      e = assert_raise(AWS::ServiceError) { other.open(sealed) }.as(AWS::ServiceError)
+      assert_equal("InvalidCiphertextException", e.code)
+    end
+  end
+end

@@ -103,11 +103,86 @@ Tested against the official SigV4 test suite (`test/fixtures/sigv4/`,
 from awslabs/aws-c-auth, Apache-2.0) at every stage, the S3
 documentation's examples, and fake endpoints for every provider.
 
+### Configuration
+
+```ruby
+config = AWS::Config.new(region: "ap-northeast-1", credentials: AWS::Credentials.default)
+config = AWS::Config.default   # from the environment
+```
+
+`AWS::Config(region:, credentials:, endpoint: nil, http: HTTP::Client.default, retries: 3, timeout: 30.seconds, retry_base: 100.milliseconds, retry_cap: 20.seconds, service_endpoints: {})`:
+the region, the credentials provider, an endpoint for every service
+(a local emulator) or one per service, the HTTP client, the retries
+(full-jitter backoff up to `min(retry_cap, retry_base * 2**n)`) and the
+longest an attempt may take. `Config.default` reads `AWS_REGION`,
+`AWS_DEFAULT_REGION` or the profile's `region`, `Credentials.default`,
+`AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_<SERVICE>` (`AWS_ENDPOINT_URL_KMS`).
+
+### KMS
+
+```ruby
+kms = AWS::KMS.new(config)   # Shareable: one per program
+
+out = kms.encrypt(key_id: "alias/app", plaintext: secret, encryption_context: {"tenant" => "t1"})
+kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: {"tenant" => "t1"}).plaintext
+
+dk = kms.generate_data_key(key_id: "alias/app", key_spec: :aes_256)   # dk.plaintext, dk.ciphertext_blob
+sig = kms.sign(key_id: "alias/sign", message: bytes, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256).signature
+kms.verify(key_id: "alias/sign", message: bytes, signature: sig, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256)   # => Bool
+pub = kms.get_public_key(key_id: "alias/sign")                 # pub.public_key: DER, Crypto::RSA::PublicKey.from_der
+kms.describe_key(key_id: "alias/app").enabled?
+kms.generate_random(number_of_bytes: 32).plaintext
+
+box = AWS::KMS::Envelope.new(kms, "alias/app", {"tenant" => "t1"})
+sealed = box.seal(large_secret)   # Bytes: a data key from KMS, AES-256-GCM
+box.open(sealed)
+```
+
+- KMS's JSON 1.1 protocol (`POST /`, `X-Amz-Target: TrentService.<Operation>`),
+  signed with SigV4. The operations: `encrypt`, `decrypt`,
+  `generate_data_key`, `generate_data_key_without_plaintext`, `sign`,
+  `verify` (`false` for `KMSInvalidSignatureException`),
+  `get_public_key`, `describe_key`, `generate_random`; keyword
+  arguments in snake_case, enumerations as symbols (`:aes_256`,
+  `:rsassa_pss_sha_256`, `message_type: :digest`), answers as `data`
+  values with `Bytes` for the base64 fields (`inspect` leaves
+  plaintexts out).
+- Throttling (`ThrottlingException`, 429), 5xx answers,
+  `KMSInternalException`, `DependencyTimeoutException` and transport
+  errors are tried again; an answer that the request's time is too far
+  from the server's is tried once more with the server's time, which
+  later requests keep.
+- `KMS::Envelope`: each `seal` makes a data key (`generate_data_key`,
+  bound to the encryption context) and encrypts with AES-256-GCM; the
+  sealed bytes are a version byte (1), the encrypted data key's length
+  (2 bytes) and the key, a 12-byte nonce, the ciphertext and its tag, the
+  bytes before the ciphertext authenticated with it. `open` decrypts the
+  data key through KMS. Nothing is cached.
+
 ### Errors
 
 - `AWS::Error`, the root of the errors this cog raises;
   `AWS::CredentialsError`, no credentials could be had (the message
-  says what was tried, never a key).
+  says what was tried, never a key); `AWS::ServiceError`, a service's
+  error: `code` (`NotFoundException`, the service's prefix dropped:
+  match on it), `detail` (its message), `status`, `request_id`;
+  `AWS::TransportError`, a request that could not be made or answered
+  (the `HTTP::Client::Error`'s class in the message). No message holds
+  a request's body or keys.
+
+### Not there yet
+
+Other services (S3, SQS, STS beyond the credentials), presigned S3
+uploads beyond `SigV4.presign` itself, a data-key cache for
+`KMS::Envelope`.
+
+### Tests
+
+`quarz test` runs against fake endpoints (a fake KMS in Quarz that
+recomputes each request's signature) and temporary files. An opt-in
+test against a real KMS reads `AWS_TEST_KMS_KEY_ID` (a symmetric key
+the environment's credentials may use; `AWS_ENDPOINT_URL_KMS` for a
+local emulator) and is never run in CI.
 
 ## License
 
