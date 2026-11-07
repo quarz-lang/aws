@@ -289,6 +289,17 @@ class KMSTest < Test::Case
     end
   end
 
+  def test_clock_skew_with_concurrent_requests
+    fake = FakeKMS.make
+    fake.offset.set(3_600_000)
+    KMSFakes.with(fake, 0) do |kms|
+      ids = Task.scope do |scope|
+        (1..6).map { |_| scope.spawn { kms.encrypt(key_id: "alias/app", plaintext: "x").key_id } }.map { |t| t.await }
+      end
+      assert(ids.all? { |i| i == FakeKMS::ARN })
+    end
+  end
+
   def test_grant_tokens_and_no_redirects
     KMSFakes.with(FakeKMS.make) do |kms|
       kms.encrypt(key_id: "alias/grant", plaintext: "x", grant_tokens: ["g1"])
@@ -301,10 +312,10 @@ class KMSTest < Test::Case
       scope.spawn { server.serve }
       begin
         creds = AWS::Credentials.static(access_key_id: FakeKMS::KEY_ID, secret_access_key: FakeKMS::SECRET)
-        # The default client: no redirect followed (the body would go
-        # with it).
+        # A client as `Config.client` makes (no redirect followed: the body
+        # would go with it), without the environment's proxy.
         config = AWS::Config.new(region: "us-east-1", credentials: creds, endpoint: URI.parse("http://127.0.0.1:#{server.local_address.port}"),
-                                 retries: 0)
+                                 http: HTTP::Client.new(max_redirects: 0, proxy: nil), retries: 0)
         e = assert_raise(AWS::ServiceError) { AWS::KMS.new(config).encrypt(key_id: "alias/redirect", plaintext: "TOPSECRET") }.as(AWS::ServiceError)
         assert_equal(307, e.status)
       ensure

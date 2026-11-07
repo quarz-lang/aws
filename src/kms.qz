@@ -210,7 +210,8 @@ class KMS
     skewed = false
     loop do
       begin
-        status, headers, text = send_once(operation, json)
+        used = @skew.get
+        status, headers, text = send_once(operation, json, used)
       rescue TransportError => e
         raise e if attempt >= @config.retries
         backoff(attempt)
@@ -226,7 +227,9 @@ class KMS
           # (Corrected when the server's clock is over 4 minutes from
           # ours as corrected so far, either way, as botocore does.)
           diff = (server - Time.now).to_ms
-          if (diff - @skew.get).abs > 240_000
+          # (Against the skew this request was signed with: another task
+          # may have corrected it since.)
+          if (diff - used).abs > 240_000
             @skew.set(diff)
             skewed = true
             next
@@ -241,11 +244,11 @@ class KMS
 
   # :nodoc:
   # One attempt: the status, headers and body of `operation`'s answer.
-  private def send_once(operation: String, json: String) -> [Int, HTTP::Headers, String]
+  private def send_once(operation: String, json: String, skew: Int) -> [Int, HTTP::Headers, String]
     url = @endpoint.path.empty? ? @endpoint.with(path: "/") : @endpoint
     req = HTTP::Client::Request.post(url, body: json, content_type: CONTENT_TYPE).header("X-Amz-Target", "#{TARGET}.#{operation}")
     keys = @config.credentials.get
-    signed = SigV4.sign(req, service: "kms", region: @config.region, credentials: keys, time: Time.now + @skew.get.milliseconds)
+    signed = SigV4.sign(req, service: "kms", region: @config.region, credentials: keys, time: Time.now + skew.milliseconds)
     begin
       Task.timeout(@config.timeout) do
         res = @config.http.request(signed)
@@ -417,8 +420,9 @@ class KMS
     # ## Raises
     #
     # `AWS::Error` for bytes that are not a sealed value of this format
-    # or were altered; `AWS::ServiceError` when KMS will not decrypt the
-    # data key (another encryption context).
+    # or were altered: `AWS::ServiceError`, a subclass, when KMS will not
+    # decrypt the data key (another encryption context, an altered key
+    # or ARN).
     def open(sealed: Bytes) -> Bytes
       raise Error.new("not a sealed value: too short") if sealed.size < 2
       raise Error.new("not a sealed value: version #{sealed[0]}") unless sealed[0] == VERSION

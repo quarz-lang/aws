@@ -65,7 +65,8 @@ data Config(
   CLIENT = Atom[HTTP::Client?].new(nil)
 
   # The client service clients use unless given another: the defaults of
-  # `HTTP::Client`, but no redirect followed. Made on first use.
+  # `HTTP::Client`, but no redirect followed. Made on first use, with the
+  # proxy the process's environment names then (`HTTP::Proxy.from_env`).
   def self.client -> HTTP::Client
     loop do
       made = CLIENT.get
