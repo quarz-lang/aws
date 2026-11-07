@@ -34,9 +34,10 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
     signed with the source profile's own keys (one level, or the profile
     itself; with `external_id`, `duration_seconds`, `role_session_name`
     when given), before the profile's own keys. A profile named by
-    `AWS_PROFILE` (or given) whose keys cannot be had raises
-    `AWS::ProfileError` (`AWS::ProfileNotFound` when neither file has
-    it), which stops a chain rather than find other keys;
+    `AWS_PROFILE` (or given), or one with `role_arn` (the default one
+    included), whose keys cannot be had raises `AWS::ProfileError`
+    (`AWS::ProfileNotFound` when neither file has it), which stops a
+    chain rather than find other keys;
   - `container`: ECS and EKS Pod Identity,
     `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI` (https on any
     host; http only on loopback, `169.254.170.2`, `169.254.170.23` or
