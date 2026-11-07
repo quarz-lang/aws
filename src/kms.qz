@@ -1,0 +1,508 @@
+require "http"
+require "json"
+require "base64"
+require "crypto"
+
+# AWS Key Management Service: keys that never leave it, used to encrypt,
+# decrypt, make data keys, sign and verify. Shareable: one per program,
+# used from any task.
+#
+# ```
+# creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+# kms = AWS::KMS.new(AWS::Config.new(region: "ap-northeast-1", credentials: creds))
+# kms.endpoint.to_s   # => "https://kms.ap-northeast-1.amazonaws.com"
+# ```
+#
+# Each operation sends KMS's JSON 1.1 protocol (`POST /` with
+# `X-Amz-Target: TrentService.<Operation>`), signed with SigV4, and
+# returns a `data` value with KMS's fields in snake_case (`Bytes` for the
+# base64 ones). KMS's errors raise `AWS::ServiceError` (match on `code`:
+# NotFoundException, AccessDeniedException, ...); a connection that
+# fails, `AWS::TransportError`. Throttling, 5xx answers and transport
+# errors are tried again (`Config#retries`, with full-jitter backoff);
+# an answer saying the clock is off is tried once more with the server's
+# time. Enumerations are symbols: `key_spec: :aes_256`,
+# `signing_algorithm: :rsassa_pss_sha_256`, `message_type: :digest`.
+class KMS
+  include Shareable
+
+  # The `X-Amz-Target` prefix of KMS's operations.
+  TARGET = "TrentService"
+  # The content type of the JSON 1.1 protocol.
+  CONTENT_TYPE = "application/x-amz-json-1.1"
+  # The codes tried again, besides the 5xx statuses and 429.
+  RETRIED_CODES = ["ThrottlingException", "KMSInternalException", "DependencyTimeoutException", "RequestTimeout",
+                   "TooManyRequestsException"]
+  # The codes that may mean the request's time is too far from the
+  # server's (corrected only when the server's Date says so).
+  SKEW_CODES = ["InvalidSignatureException", "SignatureDoesNotMatch", "RequestExpired", "RequestInTheFuture",
+                "RequestTimeTooSkewed"]
+
+  # `encrypt`'s answer.
+  data EncryptOutput = (ciphertext_blob: Bytes, key_id: String, encryption_algorithm: String)
+
+  # `decrypt`'s answer. `inspect` leaves the plaintext out.
+  data DecryptOutput(plaintext: Bytes, key_id: String, encryption_algorithm: String)
+    # `#<AWS::KMS::DecryptOutput key_id>`.
+    def inspect -> String = "#<AWS::KMS::DecryptOutput #{key_id}>"
+
+    # As `inspect`.
+    def to_s -> String = inspect
+  end
+
+  # `generate_data_key`'s answer: the key in plaintext and as encrypted
+  # under the KMS key. `inspect` leaves the plaintext out.
+  data DataKey(plaintext: Bytes, ciphertext_blob: Bytes, key_id: String)
+    # `#<AWS::KMS::DataKey key_id>`.
+    def inspect -> String = "#<AWS::KMS::DataKey #{key_id}>"
+
+    # As `inspect`.
+    def to_s -> String = inspect
+  end
+
+  # `generate_data_key_without_plaintext`'s answer.
+  data EncryptedDataKey = (ciphertext_blob: Bytes, key_id: String)
+
+  # `sign`'s answer.
+  data SignOutput = (signature: Bytes, key_id: String, signing_algorithm: String)
+
+  # `get_public_key`'s answer: the public key as DER (SubjectPublicKeyInfo;
+  # `Crypto::RSA::PublicKey.from_der` reads an RSA one).
+  data PublicKey = (public_key: Bytes, key_id: String, key_spec: String, key_usage: String,
+                    signing_algorithms: Array[String], encryption_algorithms: Array[String])
+
+  # `describe_key`'s answer.
+  data KeyMetadata(key_id: String, arn: String, key_spec: String, key_usage: String, enabled: Bool,
+                   key_state: String, description: String)
+    # Whether the key is enabled.
+    def enabled? -> Bool = enabled
+  end
+
+  # `generate_random`'s answer.
+  data RandomOutput(plaintext: Bytes)
+    # `#<AWS::KMS::RandomOutput 32 bytes>`.
+    def inspect -> String = "#<AWS::KMS::RandomOutput #{plaintext.size} bytes>"
+
+    # As `inspect`.
+    def to_s -> String = inspect
+  end
+
+  @config: Config
+  @endpoint: URI
+  # The server's clock minus ours, in milliseconds, once an answer said
+  # they differ.
+  @skew: Atom[Int]
+
+  # A client for `config`'s region and credentials, at
+  # `config.endpoint_for("kms")`.
+  def initialize(@config: Config)
+    @endpoint = config.endpoint_for("kms")
+    @skew = Atom.new(0)
+  end
+
+  # Where the requests go.
+  def endpoint -> URI = @endpoint
+
+  # The configuration.
+  def config -> Config = @config
+
+  # `#<AWS::KMS https://kms.ap-northeast-1.amazonaws.com>`.
+  def inspect -> String = "#<AWS::KMS #{@endpoint}>"
+
+  # As `inspect`.
+  def to_s -> String = inspect
+
+  # `plaintext` (up to 4096 bytes) encrypted under `key_id` (an id, an
+  # ARN, or `alias/name`), bound to `encryption_context`.
+  def encrypt(*, key_id: String, plaintext: Bytes | String, encryption_context: Hash[String, String] = Hash[String, String].new,
+              grant_tokens: Array[String] = Array[String].new, encryption_algorithm: Symbol? = nil) -> EncryptOutput
+    body = KMS.fields({"KeyId" => key_id, "Plaintext" => Base64.encode(plaintext)}, encryption_context, grant_tokens)
+    if a = encryption_algorithm
+      body = body.merge({"EncryptionAlgorithm" => KMS.enum(a)})
+    end
+    r = call("Encrypt", body)
+    EncryptOutput.new(KMS.bytes(r, "CiphertextBlob"), KMS.str(r, "KeyId"), KMS.str(r, "EncryptionAlgorithm"))
+  end
+
+  # The plaintext of `ciphertext_blob`, with the `encryption_context` it
+  # was encrypted with.
+  def decrypt(*, ciphertext_blob: Bytes, encryption_context: Hash[String, String] = Hash[String, String].new,
+              grant_tokens: Array[String] = Array[String].new, key_id: String? = nil,
+              encryption_algorithm: Symbol? = nil) -> DecryptOutput
+    body = KMS.fields({"CiphertextBlob" => Base64.encode(ciphertext_blob)}, encryption_context, grant_tokens)
+    if k = key_id
+      body = body.merge({"KeyId" => k})
+    end
+    if a = encryption_algorithm
+      body = body.merge({"EncryptionAlgorithm" => KMS.enum(a)})
+    end
+    r = call("Decrypt", body)
+    DecryptOutput.new(KMS.bytes(r, "Plaintext"), KMS.str(r, "KeyId"), KMS.str(r, "EncryptionAlgorithm"))
+  end
+
+  # A data key (`key_spec` `:aes_256` or `:aes_128`, or `number_of_bytes`)
+  # in plaintext and encrypted under `key_id`.
+  def generate_data_key(*, key_id: String, key_spec: Symbol? = :aes_256, number_of_bytes: Int? = nil,
+                        encryption_context: Hash[String, String] = Hash[String, String].new,
+                        grant_tokens: Array[String] = Array[String].new) -> DataKey
+    r = call("GenerateDataKey", KMS.data_key_fields(key_id, key_spec, number_of_bytes, encryption_context, grant_tokens))
+    DataKey.new(KMS.bytes(r, "Plaintext"), KMS.bytes(r, "CiphertextBlob"), KMS.str(r, "KeyId"))
+  end
+
+  # A data key encrypted under `key_id` only (decrypt it when it is to
+  # be used).
+  def generate_data_key_without_plaintext(*, key_id: String, key_spec: Symbol? = :aes_256, number_of_bytes: Int? = nil,
+                                          encryption_context: Hash[String, String] = Hash[String, String].new,
+                                          grant_tokens: Array[String] = Array[String].new) -> EncryptedDataKey
+    r = call("GenerateDataKeyWithoutPlaintext", KMS.data_key_fields(key_id, key_spec, number_of_bytes, encryption_context, grant_tokens))
+    EncryptedDataKey.new(KMS.bytes(r, "CiphertextBlob"), KMS.str(r, "KeyId"))
+  end
+
+  # The signature of `message` (`message_type` `:raw`, up to 4096 bytes,
+  # or `:digest`, its hash) with the asymmetric key `key_id`.
+  def sign(*, key_id: String, message: Bytes | String, signing_algorithm: Symbol, message_type: Symbol = :raw,
+           grant_tokens: Array[String] = Array[String].new) -> SignOutput
+    body = KMS.fields({"KeyId" => key_id, "Message" => Base64.encode(message), "MessageType" => KMS.enum(message_type),
+                       "SigningAlgorithm" => KMS.enum(signing_algorithm)}, nil, grant_tokens)
+    r = call("Sign", body)
+    SignOutput.new(KMS.bytes(r, "Signature"), KMS.str(r, "KeyId"), KMS.str(r, "SigningAlgorithm"))
+  end
+
+  # Whether `signature` is `key_id`'s signature of `message`: false
+  # when KMS says it is not (KMSInvalidSignatureException).
+  def verify(*, key_id: String, message: Bytes | String, signature: Bytes, signing_algorithm: Symbol,
+             message_type: Symbol = :raw, grant_tokens: Array[String] = Array[String].new) -> Bool
+    body = KMS.fields({"KeyId" => key_id, "Message" => Base64.encode(message), "MessageType" => KMS.enum(message_type),
+                       "Signature" => Base64.encode(signature), "SigningAlgorithm" => KMS.enum(signing_algorithm)}, nil, grant_tokens)
+    r = call("Verify", body)
+    r["SignatureValid"]?&.as_bool? || false
+  rescue ServiceError => e
+    return false if e.code == "KMSInvalidSignatureException"
+    raise e
+  end
+
+  # The public key of the asymmetric key `key_id`.
+  def get_public_key(*, key_id: String, grant_tokens: Array[String] = Array[String].new) -> PublicKey
+    r = call("GetPublicKey", KMS.fields({"KeyId" => key_id}, nil, grant_tokens))
+    PublicKey.new(KMS.bytes(r, "PublicKey"), KMS.str(r, "KeyId"), KMS.str(r, "KeySpec"), KMS.str(r, "KeyUsage"),
+                  KMS.strs(r, "SigningAlgorithms"), KMS.strs(r, "EncryptionAlgorithms"))
+  end
+
+  # What `key_id` is.
+  def describe_key(*, key_id: String, grant_tokens: Array[String] = Array[String].new) -> KeyMetadata
+    r = call("DescribeKey", KMS.fields({"KeyId" => key_id}, nil, grant_tokens))
+    m = r["KeyMetadata"]? || raise ServiceError.new(code: "MalformedAnswer", message: "DescribeKey answered without KeyMetadata", status: 200)
+    KeyMetadata.new(KMS.str(m, "KeyId"), KMS.str(m, "Arn"), KMS.str(m, "KeySpec"), KMS.str(m, "KeyUsage"),
+                    m["Enabled"]?&.as_bool? || false, KMS.str(m, "KeyState"), KMS.str(m, "Description"))
+  end
+
+  # `number_of_bytes` random bytes (1 to 1024) from KMS.
+  def generate_random(*, number_of_bytes: Int) -> RandomOutput
+    r = call("GenerateRandom", {"NumberOfBytes" => number_of_bytes.as(Object)})
+    RandomOutput.new(KMS.bytes(r, "Plaintext"))
+  end
+
+  # :nodoc:
+  # `operation`'s answer to `body`, tried again as the class says.
+  def call(operation: String, body: Hash[String, Object]) -> JSON::Value
+    json = JSON.generate(body)
+    attempt = 0
+    skewed = false
+    loop do
+      begin
+        used = @skew.get
+        status, headers, text = send_once(operation, json, used)
+      rescue TransportError => e
+        raise e if attempt >= @config.retries
+        backoff(attempt)
+        attempt += 1
+        next
+      end
+      if status >= 200 && status <= 299
+        return KMS.parse(text, operation, status)
+      end
+      error = KMS.error(status, headers, text)
+      if !skewed && KMS.skew?(error)
+        if server = KMS.http_date(headers["date"])
+          # (Corrected when the server's clock is over 4 minutes from
+          # ours as corrected so far, either way, as botocore does.)
+          diff = (server - Time.now).to_ms
+          # (Against the skew this request was signed with: another task
+          # may have corrected it since.)
+          if (diff - used).abs > 240_000
+            @skew.set(diff)
+            skewed = true
+            next
+          end
+        end
+      end
+      raise error unless attempt < @config.retries && KMS.retry?(error)
+      backoff(attempt)
+      attempt += 1
+    end
+  end
+
+  # :nodoc:
+  # One attempt: the status, headers and body of `operation`'s answer.
+  private def send_once(operation: String, json: String, skew: Int) -> [Int, HTTP::Headers, String]
+    url = @endpoint.path.empty? ? @endpoint.with(path: "/") : @endpoint
+    req = HTTP::Client::Request.post(url, body: json, content_type: CONTENT_TYPE).header("X-Amz-Target", "#{TARGET}.#{operation}")
+    keys = @config.credentials.get
+    signed = SigV4.sign(req, service: "kms", region: @config.region, credentials: keys, time: Time.now + skew.milliseconds)
+    begin
+      Task.timeout(@config.timeout) do
+        res = @config.http.request(signed)
+        [res.status, res.headers, res.body.read]
+      end
+    rescue HTTP::Client::Error => e
+      raise TransportError.new("KMS #{operation}: #{e.class.name}: #{e.message}")
+    rescue Task::Timeout
+      raise TransportError.new("KMS #{operation}: no answer within #{@config.timeout}")
+    end
+  end
+
+  # :nodoc:
+  # Waits before retry `attempt` (from 0): a random time up to
+  # `min(retry_cap, retry_base * 2**attempt)`.
+  private def backoff(attempt: Int) -> Void
+    cap = @config.retry_cap.to_ms
+    ceiling = @config.retry_base.to_ms
+    attempt.times { ceiling = ceiling * 2 if ceiling < cap }
+    ceiling = cap if ceiling > cap
+    Task.sleep(Random.rand(0..ceiling).milliseconds) if ceiling > 0
+  end
+
+  # :nodoc:
+  def self.fields(base: Hash[String, Object], context: Hash[String, String]?, grants: Array[String]) -> Hash[String, Object]
+    out = base
+    if c = context
+      out = out.merge({"EncryptionContext" => c.as(Object)}) unless c.empty?
+    end
+    out = out.merge({"GrantTokens" => grants.as(Object)}) unless grants.empty?
+    out
+  end
+
+  # :nodoc:
+  def self.data_key_fields(key_id: String, spec: Symbol?, n: Int?, context: Hash[String, String],
+                           grants: Array[String]) -> Hash[String, Object]
+    base: Hash[String, Object] = {"KeyId" => key_id.as(Object)}
+    if count = n
+      base = base.merge({"NumberOfBytes" => count.as(Object)})
+    elsif s = spec
+      base = base.merge({"KeySpec" => KMS.enum(s).as(Object)})
+    end
+    KMS.fields(base, context, grants)
+  end
+
+  # :nodoc:
+  # `:rsassa_pss_sha_256` as KMS writes it: `RSASSA_PSS_SHA_256`.
+  def self.enum(s: Symbol) -> String = s.to_s.upcase
+
+  # :nodoc:
+  def self.parse(text: String, operation: String, status: Int) -> JSON::Value
+    JSON.parse(text)
+  rescue JSON::ParseError
+    raise ServiceError.new(code: "MalformedAnswer", message: "#{operation} answered something that is not JSON", status: status)
+  end
+
+  # :nodoc:
+  def self.str(v: JSON::Value, name: String) -> String = v[name]?&.as_s? || ""
+
+  # :nodoc:
+  def self.strs(v: JSON::Value, name: String) -> Array[String]
+    a = v[name]?&.as_a? || return Array[String].new
+    a.map { |x| x.as_s? || "" }
+  end
+
+  # :nodoc:
+  def self.bytes(v: JSON::Value, name: String) -> Bytes
+    s = v[name]?&.as_s? || raise ServiceError.new(code: "MalformedAnswer", message: "an answer without #{name}", status: 200)
+    Base64.decode(s)
+  rescue ArgumentError
+    raise ServiceError.new(code: "MalformedAnswer", message: "#{name} is not base64", status: 200)
+  end
+
+  # :nodoc:
+  # The `ServiceError` of an answer: the code from the body's `__type`
+  # or the `x-amzn-ErrorType` header, the service's prefix dropped
+  # (`com.amazonaws.kms#NotFoundException`, `NotFoundException:http://...`).
+  def self.error(status: Int, headers: HTTP::Headers, text: String) -> ServiceError
+    doc: JSON::Value? = begin
+                          JSON.parse(text)
+                        rescue JSON::ParseError
+                          nil
+                        end
+    type = doc ? doc["__type"]?&.as_s? : nil
+    type ||= headers["x-amzn-errortype"]
+    code = type ? type.partition(":")[0].rpartition("#")[2] : ""
+    code = status == 429 ? "TooManyRequests" : "HTTP#{status}" if code.empty?
+    message = doc ? (doc["message"]?&.as_s? || doc["Message"]?&.as_s? || "") : ""
+    ServiceError.new(code: code, message: message, status: status, request_id: headers["x-amzn-requestid"])
+  end
+
+  # :nodoc:
+  def self.retry?(e: ServiceError) -> Bool
+    s = e.status
+    s == 429 || s == 500 || s == 502 || s == 503 || s == 504 || RETRIED_CODES.include?(e.code)
+  end
+
+  # :nodoc:
+  # Whether the answer may say the request's time is too far from the
+  # server's: its code; the server's Date decides.
+  def self.skew?(e: ServiceError) -> Bool = SKEW_CODES.include?(e.code)
+
+  # :nodoc:
+  MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+  # :nodoc:
+  # An HTTP date (`Sat, 07 Nov 2026 12:00:00 GMT`), nil when it is not one.
+  def self.http_date(text: String?) -> Time?
+    t = text || return nil
+    m = t.match(/\A[A-Za-z]{3}, (\d{2}) ([A-Za-z]{3}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT\z/) || return nil
+    month = MONTHS.index(m[2].as(String)) || return nil
+    Time.utc(m[3].as(String).to_i, month + 1, m[1].as(String).to_i, m[4].as(String).to_i, m[5].as(String).to_i, m[6].as(String).to_i)
+  rescue ArgumentError
+    nil
+  end
+
+  # Envelope encryption: each secret encrypted locally with AES-256-GCM
+  # under a fresh data key from KMS (`generate_data_key`), the data key
+  # kept, encrypted under the KMS key, with the ciphertext. For secrets
+  # over KMS's 4 KB, and for many secrets without a KMS call each to
+  # encrypt (opening one decrypts its data key through KMS). Nothing is
+  # cached but the key an alias or a bare key id names (`RESOLVED_FOR`).
+  #
+  # A sealed value is one `Bytes`: a version byte (1); the length of the
+  # KMS key's ARN (one byte) and the ARN, as `generate_data_key` gave it
+  # (`open` decrypts under that key, when it accepts it: the key `key_id`
+  # names, or one of `allowed_keys`); the encrypted data key's length
+  # (two bytes, big-endian) and the key; the 12-byte nonce; then the
+  # ciphertext and its 16-byte tag. The bytes before the ciphertext are
+  # its additional authenticated data, so that none of them can be
+  # changed either.
+  #
+  # ```
+  # creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+  # kms = AWS::KMS.new(AWS::Config.new(region: "ap-northeast-1", credentials: creds))
+  # box = AWS::KMS::Envelope.new(kms, "alias/app", {"tenant" => "t1"})
+  # box.inspect   # => "#<AWS::KMS::Envelope alias/app>"
+  # ```
+  data Envelope(
+    # The client.
+    kms: KMS,
+    # The KMS key data keys are made under: an id, an ARN or
+    # `alias/name`.
+    key_id: String,
+    # The encryption context each data key is bound to (and must be given
+    # again to open).
+    encryption_context: Hash[String, String] = Hash[String, String].new,
+    # The key ARNs `open` accepts besides the one `key_id` names (that of
+    # an alias's previous key, once it was moved).
+    allowed_keys: Array[String] = Array[String].new,
+    # :nodoc:
+    # What an alias or a bare key id resolved to (`describe_key`). Not
+    # for callers: it is what `open` accepts.
+    resolved: Atom[Resolution?] = Atom[Resolution?].new(nil)
+  )
+    # :nodoc:
+    # The client, the key id it was resolved for and when (a copy made
+    # with `with` may name another client or key id). Not for callers.
+    data Resolution = (kms: KMS, key_id: String, arn: String, at: Duration)
+
+    # How long the key an alias or a bare key id resolved to is kept
+    # before it is asked again (a moved alias is also followed at the
+    # first value it refuses).
+    RESOLVED_FOR = 5.minutes
+    # The format's version byte.
+    VERSION = 1
+    # The nonce's size.
+    NONCE_SIZE = 12
+    # A KMS key's ARN (not an alias's).
+    KEY_ARN = /\Aarn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key\/[A-Za-z0-9-]+\z/
+
+    # `plaintext` sealed under a new data key.
+    def seal(plaintext: Bytes | String) -> Bytes
+      dk = kms.generate_data_key(key_id: key_id, key_spec: :aes_256, encryption_context: encryption_context)
+      blob = dk.ciphertext_blob
+      arn = dk.key_id.to_bytes
+      raise Error.new("a key ARN of #{arn.size} bytes (255 at most)") if arn.empty? || arn.size > 255
+      raise Error.new("an encrypted data key of #{blob.size} bytes") if blob.empty? || blob.size > 65_535
+      nonce = Crypto.random_bytes(NONCE_SIZE)
+      head = Bytes[VERSION, arn.size] + arn + Bytes[blob.size / 256, blob.size % 256] + blob + nonce
+      head + Crypto::AES::GCM.new(dk.plaintext).seal(nonce, plaintext, aad: head)
+    end
+
+    # The plaintext of `sealed`, its data key decrypted through KMS
+    # under the key the header names, when that is the key `key_id` names
+    # (an alias followed if it moved) or one of `allowed_keys`.
+    #
+    # ## Raises
+    #
+    # `ArgumentError` when `allowed_keys` holds what is not a key ARN.
+    # `AWS::Error` for bytes that are not a sealed value of this format,
+    # were altered, or name a key not accepted: `AWS::ServiceError`, a
+    # subclass, when KMS will not
+    # decrypt the data key (another encryption context, an altered key
+    # or ARN).
+    def open(sealed: Bytes) -> Bytes
+      raise Error.new("not a sealed value: too short") if sealed.size < 2
+      raise Error.new("not a sealed value: version #{sealed[0]}") unless sealed[0] == VERSION
+      a = sealed[1]
+      raise Error.new("not a sealed value: too short") if sealed.size < 2 + a + 2
+      arn = sealed.slice(2, a).decode? || raise Error.new("not a sealed value: the key ARN is not UTF-8")
+      n = sealed[2 + a] * 256 + sealed[3 + a]
+      start = 4 + a
+      rest = start + n + NONCE_SIZE
+      raise Error.new("not a sealed value: too short") if a == 0 || n == 0 || sealed.size < rest + 16
+      blob = sealed.slice(start, n)
+      nonce = sealed.slice(start + n, NONCE_SIZE)
+      head = sealed.slice(0, rest)
+      accept!(arn)
+      key = kms.decrypt(ciphertext_blob: blob, encryption_context: encryption_context, key_id: arn).plaintext
+      raise Error.new("not a sealed value: a data key of #{key.size} bytes") unless key.size == 32
+      Crypto::AES::GCM.new(key).open?(nonce, sealed.slice(rest, sealed.size - rest), aad: head) ||
+        raise Error.new("the sealed value was altered")
+    end
+
+    # Refuses `arn` unless it is the key `key_id` names (an alias or a
+    # bare id resolved with `describe_key`, asked again before refusing
+    # when the key came from the cache, so that a moved alias is
+    # followed) or one of `allowed_keys`: a
+    # sealed value names the key to decrypt under, and one forged under
+    # another key the caller may decrypt with would otherwise open, to a
+    # plaintext of the forger's choosing.
+    private def accept!(arn: String) -> Void
+      allowed_keys.each do |k|
+        raise ArgumentError, "allowed_keys holds what is not a key ARN: #{k.inspect}" unless k.match?(KEY_ARN)
+      end
+      return if allowed_keys.include?(arn)
+      if key_id.match?(KEY_ARN)
+        return if arn == key_id
+        raise Error.new("sealed under #{arn}, which is not the key #{key_id} nor in allowed_keys")
+      end
+      kept = resolved.get
+      fresh = kept && kept.kms.equal?(kms) && kept.key_id == key_id && Time.monotonic - kept.at < RESOLVED_FOR
+      current = fresh ? kept.as(Resolution).arn : resolve
+      return if arn == current
+      # (Kept: asked again once, for a moved alias.)
+      if fresh
+        current = resolve
+        return if arn == current
+      end
+      raise Error.new("sealed under #{arn}, which is not the key #{key_id} points to (#{current}) nor in allowed_keys")
+    end
+
+    # The key ARN `key_id` names now.
+    private def resolve -> String
+      arn = kms.describe_key(key_id: key_id).arn
+      resolved.set(Resolution.new(kms, key_id, arn, Time.monotonic))
+      arn
+    end
+
+    # `#<AWS::KMS::Envelope alias/app>`.
+    def inspect -> String = "#<AWS::KMS::Envelope #{key_id}>"
+
+    # As `inspect`.
+    def to_s -> String = inspect
+  end
+end

@@ -3,3 +3,43 @@
 # anywhere.)
 class Error < StandardError
 end
+
+# A service answered with an error: its `code` (NotFoundException,
+# the service's prefix dropped; match on it), its message, the HTTP
+# status and the request id to give AWS support. The message never holds
+# the request's body or keys.
+class ServiceError < Error
+  @code: String
+  @status: Int
+  @request_id: String?
+
+  # An error with the service's `code`, `message`, `status` and
+  # `request_id`.
+  def initialize(*, code: String, message: String, status: Int, request_id: String? = nil)
+    @code = code
+    @status = status
+    @request_id = request_id
+    @detail = message
+    super("#{code}: #{message} (#{status}#{request_id ? ", request #{request_id}" : ""})")
+  end
+
+  @detail: String
+
+  # The error's code: NotFoundException, AccessDeniedException.
+  def code -> String = @code
+
+  # The service's message alone.
+  def detail -> String = @detail
+
+  # The HTTP status.
+  def status -> Int = @status
+
+  # The `x-amzn-RequestId` of the answer, when there is one.
+  def request_id -> String? = @request_id
+end
+
+# A request could not be made or its answer not read: the connection
+# failed, timed out, or broke. Wraps the `HTTP::Client::Error`, whose
+# class the message names.
+class TransportError < Error
+end

@@ -1,0 +1,28 @@
+require "test"
+
+# Against a real KMS, opt-in: AWS_TEST_KMS_KEY_ID names a symmetric key
+# the environment's credentials may use (AWS_ENDPOINT_URL_KMS for a local
+# emulator). Never run in CI.
+class KMSRealTest < Test::Case
+  def key_id -> String
+    k = ENV["AWS_TEST_KMS_KEY_ID"]?
+    omit("AWS_TEST_KMS_KEY_ID is not set: the test against a real KMS is opt-in") if k.nil? || k.empty?
+    k
+  end
+
+  def kms -> AWS::KMS = AWS::KMS.new(AWS::Config.default)
+
+  def test_round_trips
+    k = key_id
+    client = kms
+    ctx = {"purpose" => "quarz-aws-test"}
+    out = client.encrypt(key_id: k, plaintext: "hello", encryption_context: ctx)
+    assert_equal(b"hello", client.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: ctx).plaintext)
+    dk = client.generate_data_key(key_id: k, encryption_context: ctx)
+    assert_equal(32, dk.plaintext.size)
+    box = AWS::KMS::Envelope.new(client, k, ctx)
+    assert_equal(("x" * 5000).to_bytes, box.open(box.seal("x" * 5000)))
+    assert(client.describe_key(key_id: k).enabled?)
+    assert_equal(16, client.generate_random(number_of_bytes: 16).plaintext.size)
+  end
+end
