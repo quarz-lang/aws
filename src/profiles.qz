@@ -12,7 +12,8 @@
 # ```
 module Profiles
   # The settings of profile `name`, nil when neither file has it (`env`
-  # gives the files' paths and HOME).
+  # gives the files' paths and HOME). Raises `CredentialsError` for a
+  # file that cannot be read.
   def self.settings(name: String, env: Hash[String, String] = ENV) -> Hash[String, String]?
     config = Profiles.read(Profiles.config_path(env), true)[name]?
     creds = Profiles.read(Profiles.credentials_path(env), false)[name]?
@@ -21,7 +22,7 @@ module Profiles
   end
 
   # The region of profile `name` (AWS_PROFILE, else `default`), nil
-  # when it has none.
+  # when it has none. Raises `CredentialsError` as `.settings` does.
   def self.region(name: String? = nil, env: Hash[String, String] = ENV) -> String?
     p = env["AWS_PROFILE"]?
     s = Profiles.settings(name || (p && !p.empty? ? p : nil) || "default", env)
@@ -55,25 +56,28 @@ module Profiles
 
   # The profiles of an INI text: `[section]` lines (a comment may follow
   # them), `name = value` lines under them (names lowercased, values
-  # trimmed), `#` and `;` comment lines. An indented line continues the
-  # setting above it or is one of its sub-settings (`s3 =` then
-  # `  addressing_style = path`): not a setting of the profile. In a
+  # trimmed), `#` and `;` comment lines. A line indented deeper than the
+  # setting above it continues it or is one of its sub-settings (`s3 =`
+  # then `  addressing_style = path`): not a setting of the profile, as
+  # configparser reads it. In a
   # config file (`config`), `[profile name]` is profile `name` and a
   # section of another form but `[default]` is not a profile.
   def self.parse(text: String, config: Bool) -> Hash[String, Hash[String, String]]
     out = Hash::Builder[String, Hash[String, String]].new
     current: String? = nil
-    # (Whether an indented line is a setting: right under a section, as
-    # configparser takes it; after a setting, a sub-setting or the
-    # value's continuation.)
-    after_section = false
+    # (The indentation of the last setting: a line deeper is its
+    # continuation or sub-setting.)
+    last_indent: Int? = nil
     text.split("\n").each do |raw|
       line = raw.strip
       next if line.empty? || line.start_with?("#") || line.start_with?(";")
-      next if (raw.start_with?(" ") || raw.start_with?("\t")) && !after_section
+      indent = raw.size - raw.lstrip.size
+      if li = last_indent
+        next if indent > li
+      end
       if line.start_with?("[")
         m = line.match(/\A\[([^\]]*)\]\s*(?:[#;].*)?\z/)
-        after_section = true
+        last_indent = nil
         # (A malformed header: what follows is no profile's.)
         if m.nil?
           current = nil
@@ -92,7 +96,7 @@ module Profiles
         end
         next
       end
-      after_section = false
+      last_indent = indent
       c = current
       next if c.nil?
       k, eq, v = line.partition("=")
