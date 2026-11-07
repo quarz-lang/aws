@@ -1,6 +1,6 @@
 # The shared configuration files the SDKs and the CLI read:
-# `~/.aws/credentials` (`AWS_SHARED_CREDENTIALS_FILE`), whose sections
-# are profile names, and `~/.aws/config` (`AWS_CONFIG_FILE`), whose
+# `~/.aws/credentials` (AWS_SHARED_CREDENTIALS_FILE), whose sections
+# are profile names, and `~/.aws/config` (AWS_CONFIG_FILE), whose
 # sections are `[default]` and `[profile name]`. A profile's settings
 # are both files' merged, the credentials file's winning.
 #
@@ -12,7 +12,7 @@
 # ```
 module Profiles
   # The settings of profile `name`, nil when neither file has it (`env`
-  # gives the files' paths and `HOME`).
+  # gives the files' paths and HOME).
   def self.settings(name: String, env: Hash[String, String] = ENV) -> Hash[String, String]?
     config = Profiles.read(Profiles.config_path(env), true)[name]?
     creds = Profiles.read(Profiles.credentials_path(env), false)[name]?
@@ -20,7 +20,7 @@ module Profiles
     (config || {}).merge(creds || {})
   end
 
-  # The region of profile `name` (`AWS_PROFILE`, else `default`), nil
+  # The region of profile `name` (AWS_PROFILE, else `default`), nil
   # when it has none.
   def self.region(name: String? = nil, env: Hash[String, String] = ENV) -> String?
     s = Profiles.settings(name || env["AWS_PROFILE"]? || "default", env)

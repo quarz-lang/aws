@@ -3,7 +3,7 @@ require "uri"
 require "http"
 
 # AWS Signature Version 4: signs an `HTTP::Client::Request` for any AWS
-# service, with the `Authorization` header (`.sign`) or in the query
+# service, with the Authorization header (`.sign`) or in the query
 # (`.presign`), as the specification describes
 # (docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html).
 #
@@ -16,7 +16,7 @@ require "http"
 # # => "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, SignedHeaders=host;x-amz-date, Signature=5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
 # ```
 module SigV4
-  # The algorithm's name, in the `Authorization` header and the string to
+  # The algorithm's name, in the Authorization header and the string to
   # sign.
   ALGORITHM = "AWS4-HMAC-SHA256"
   # The payload hash of an unsigned body (`unsigned_payload: true`).
@@ -24,7 +24,7 @@ module SigV4
   # The SHA-256 of nothing: the payload hash of a request without a body.
   EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   # The headers never signed: the signature's own, those a proxy or the
-  # client may change (`User-Agent`, `Expect`), and the hop-by-hop ones.
+  # client may change (`User-Agent`, Expect), and the hop-by-hop ones.
   # (`Content-Length` is signed when the request carries one: `.sign`.)
   UNSIGNED_HEADERS = ["authorization", "user-agent", "expect", "connection", "transfer-encoding", "keep-alive", "te", "upgrade", "proxy-authorization", "x-amzn-trace-id"]
 
@@ -34,20 +34,20 @@ module SigV4
   data Parts = (canonical_request: String, signed_headers: String, string_to_sign: String, signature: String)
 
   # `request` signed for `service` in `region` with `credentials`, at
-  # `time`: with `Host` (from the URL, when it has none), `X-Amz-Date`,
+  # `time`: with Host (from the URL, when it has none), `X-Amz-Date`,
   # `X-Amz-Security-Token` (for temporary keys), `X-Amz-Content-Sha256`
   # (for `s3`, with `content_sha256: true`, `payload_hash:` or
-  # `unsigned_payload: true`) and `Authorization`. Every header the
+  # `unsigned_payload: true`) and Authorization. Every header the
   # request has is signed but `UNSIGNED_HEADERS`.
   #
-  # The payload hash is the body's SHA-256 (`Content::Text`,
-  # `Content::Binary`; that of nothing for `Content::Empty`), `payload_hash`
+  # The payload hash is the body's SHA-256 (`HTTP::Content::Text`,
+  # `HTTP::Content::Binary`; that of nothing for `HTTP::Content::Empty`), `payload_hash`
   # when given, or `UNSIGNED-PAYLOAD` with `unsigned_payload: true`; a
-  # `Content::Stream` body needs one of the last two.
+  # `HTTP::Content::Stream` body needs one of the last two.
   #
   # ## Raises
   #
-  # `ArgumentError` for a `Content::Stream` body without `payload_hash` or
+  # `ArgumentError` for a `HTTP::Content::Stream` body without `payload_hash` or
   # `unsigned_payload`, or a `Content-Length` header that is not the
   # body's size (or on a streamed body, which is sent chunked).
   def self.sign(request: HTTP::Client::Request, *, service: String, region: String, credentials: Credentials::Keys,
@@ -120,7 +120,7 @@ module SigV4
   end
 
   # The stages of the signature of a request: `method`, `url`, `headers`
-  # (as they will be sent, `Host` included) and the payload's hash, for
+  # (as they will be sent, Host included) and the payload's hash, for
   # `service` in `region` at `time`. `.sign` and `.presign` are made of
   # it; tests compare each stage with the specification's.
   def self.parts(method: String, url: URI, headers: HTTP::Headers, payload_hash: String, *, service: String,
