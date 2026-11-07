@@ -1,62 +1,105 @@
 # :nodoc:
 # A reader of STS's XML answers, for the few fields the credentials
-# providers need: not a general XML parser. It reads elements (their
-# attributes and namespace prefixes skipped), text with the five
-# predefined entities and character references, an XML declaration and
-# comments, and refuses anything else (a DOCTYPE, CDATA, a processing
-# instruction, a stray `<` or `&`, unbalanced tags), so that nothing it
-# does not understand passes for an answer.
+# providers need: not a general XML parser. It reads one root element
+# and the elements in it (their attributes, quoted, skipped; their
+# names compared whole, prefix and all, and matched by local name),
+# text with the five predefined entities and character references, an
+# XML declaration and comments, and refuses anything else (a DOCTYPE,
+# CDATA, a processing instruction, a stray `<` or `&`, unbalanced tags,
+# text or elements outside the root), so that nothing it does not
+# understand passes for an answer.
 module STSXML
-  # The text of every element whose local name (the prefix dropped) is
-  # in `names`, by that name; the first one wins. Raises
+  # The text of every element whose local name is in `names` and whose
+  # parents end with `within` (local names: `["AssumeRoleResult",
+  # "Credentials"]`), by that name; the first one wins. Raises
   # `CredentialsError` on what it does not read.
-  def self.fields(xml: String, names: Array[String]) -> Hash[String, String]
+  def self.fields(xml: String, names: Array[String], within: Array[String] = []) -> Hash[String, String]
     out = Hash::Builder[String, String].new
     stack: Array[String] = []
     text = String::Builder.new
+    rooted = false
     i = 0
     n = xml.size
     while i < n
       c = xml[i, 1]
       if c == "<"
-        close = xml.index(">", i) || STSXML.refuse("an unterminated tag")
+        close = STSXML.tag_end(xml, i + 1)
         tag = xml[i + 1, close - i - 1]
         if tag.start_with?("?")
-          STSXML.refuse("a processing instruction") unless i == STSXML.lead(xml) && tag.start_with?("?xml") && tag.end_with?("?")
+          STSXML.refuse("a processing instruction") unless i == STSXML.lead(xml) && tag.start_with?("?xml ") && tag.end_with?("?")
         elsif tag.start_with?("!--")
           close = (xml.index("-->", i + 4) || STSXML.refuse("an unterminated comment")) + 2
         elsif tag.start_with?("!")
           STSXML.refuse("a DOCTYPE or CDATA section")
         elsif tag.start_with?("/")
-          name = STSXML.local(tag[1, tag.size - 1].strip)
-          STSXML.refuse("an unbalanced </#{name}>") if stack.empty? || stack.last != name
+          qname = tag[1, tag.size - 1].strip
+          STSXML.refuse("an unbalanced </#{qname}>") if stack.empty? || stack.last != qname
           stack = stack.take(stack.size - 1)
-          out[name] = text.to_s.strip if names.include?(name) && !out.key?(name)
+          name = STSXML.local(qname)
+          if names.include?(name) && !out.key?(name) && STSXML.under?(stack, within)
+            out[name] = text.to_s.strip
+          end
           text = String::Builder.new
         else
           empty = tag.end_with?("/")
           body = empty ? tag[0, tag.size - 1] : tag
-          name = STSXML.local(body.split(/\s/)[0]? || "")
-          STSXML.refuse("an element without a name") if name.empty?
+          qname = body.split(/\s/)[0]? || ""
+          STSXML.refuse("an element without a name") if qname.empty?
+          STSXML.refuse("a second root element") if stack.empty? && rooted
+          rooted = true
           if empty
-            out[name] = "" if names.include?(name) && !out.key?(name)
+            name = STSXML.local(qname)
+            out[name] = "" if names.include?(name) && !out.key?(name) && STSXML.under?(stack, within)
           else
-            stack = stack.push(name)
+            stack = stack.push(qname)
           end
           text = String::Builder.new
         end
         i = close + 1
       elsif c == "&"
         semi = xml.index(";", i) || STSXML.refuse("an unterminated entity")
+        STSXML.refuse("an entity outside the root") if stack.empty?
         text << STSXML.entity(xml[i + 1, semi - i - 1])
         i = semi + 1
       else
+        STSXML.refuse("text outside the root") if stack.empty? && !c.strip.empty?
         text << c
         i += 1
       end
     end
+    STSXML.refuse("no root element") unless rooted
     STSXML.refuse("unclosed elements") unless stack.empty?
     out.to_h
+  end
+
+  # :nodoc:
+  # Where the tag that starts at `from` (after its `<`) ends: its `>`
+  # outside quoted attribute values.
+  def self.tag_end(xml: String, from: Int) -> Int
+    quote: String? = nil
+    i = from
+    while i < xml.size
+      c = xml[i, 1]
+      if q = quote
+        quote = nil if c == q
+      elsif c == "\"" || c == "'"
+        quote = c
+      elsif c == "<"
+        STSXML.refuse("a `<` in a tag")
+      elsif c == ">"
+        return i
+      end
+      i += 1
+    end
+    STSXML.refuse("an unterminated tag")
+  end
+
+  # :nodoc:
+  # Whether the parents' local names end with `within`.
+  def self.under?(stack: Array[String], within: Array[String]) -> Bool
+    return true if within.empty?
+    return false if stack.size < within.size
+    stack.drop(stack.size - within.size).map { |q| STSXML.local(q) } == within
   end
 
   # :nodoc:
@@ -87,7 +130,9 @@ module STSXML
              elsif name.match?(/\A#[0-9]{1,7}\z/) then name[1, name.size - 1].to_i
              else nil
              end
-      STSXML.refuse("the entity &#{name};") if code.nil? || code <= 0 || code > 0x10FFFF
+      if code.nil? || code <= 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)
+        STSXML.refuse("the entity &#{name};")
+      end
       code.chr
     end
   end

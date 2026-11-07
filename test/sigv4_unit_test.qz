@@ -114,3 +114,43 @@ class SigV4UnitTest < Test::Case
     assert(a.include?("/us-east-1/service/aws4_request"))
   end
 end
+
+# Fixes from the review of the first version.
+class SigV4ReviewFixesTest < Test::Case
+  def keys -> AWS::Credentials::Keys = AWS::Credentials::Keys.new("AKIDEXAMPLE", "secret")
+
+  def test_host_is_the_urls
+    req = HTTP::Client::Request.get("https://example.amazonaws.com/", {"Host" => "other.example"})
+    assert_equal("example.amazonaws.com", AWS::SigV4.sign(req, service: "s", region: "r", credentials: keys).headers["host"])
+  end
+
+  def test_content_length_zero_only_where_it_is_sent
+    get = HTTP::Client::Request.get("https://example.amazonaws.com/", {"Content-Length" => "0"})
+    e = assert_raise(ArgumentError) { AWS::SigV4.sign(get, service: "s", region: "r", credentials: keys) }
+    assert_equal("a Content-Length on a GET without a body (it is not sent)", e.message)
+    post = HTTP::Client::Request.new("POST", "https://example.amazonaws.com/", headers: {"Content-Length" => "0"})
+    assert(AWS::SigV4.sign(post, service: "s", region: "r", credentials: keys).headers["authorization"].as(String).include?("content-length;"))
+  end
+
+  def test_signing_again_drops_the_old_signature
+    req = HTTP::Client::Request.get("https://example.amazonaws.com/")
+    once = AWS::SigV4.sign(req, service: "s3", region: "r", credentials: AWS::Credentials::Keys.new("AKID", "s", "OLDTOKEN"))
+    again = AWS::SigV4.sign(once, service: "s", region: "r", credentials: keys)
+    assert(!again.headers.key?("x-amz-security-token"))
+    assert(!again.headers.key?("x-amz-content-sha256"))
+    assert_equal(1, again.headers.all("x-amz-date").size)
+    url = AWS::SigV4.presign(req, service: "s", region: "r", credentials: keys, expires_in: 1.minute)
+    twice = AWS::SigV4.presign(req.with(url: url), service: "s", region: "r", credentials: keys, expires_in: 1.minute)
+    assert_equal(1, (twice.query || "").split("&").count { |p| p.start_with?("X-Amz-Signature=") })
+  end
+
+  def test_bytes_that_are_not_utf8
+    assert_equal("a=%25zz&b=%E9", AWS::SigV4.canonical_query("a=%zz&b=%E9"))
+    assert_equal("/%E9", AWS::SigV4.canonical_path("/%E9", "s3"))
+    assert_equal("/%25E9", AWS::SigV4.canonical_path("/%E9", "kms"))
+  end
+
+  def test_tabs_are_trimmed_as_spaces
+    assert_equal("a b", AWS::SigV4.trim(" a\t \tb\t"))
+  end
+end

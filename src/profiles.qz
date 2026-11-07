@@ -52,19 +52,22 @@ module Profiles
     Profiles.parse(text, config)
   end
 
-  # The profiles of an INI text: `[section]` lines, `name = value` lines
-  # under them (names lowercased, values trimmed), `#` and `;` comment
-  # lines. In a config file (`config`), `[profile name]` is profile
-  # `name` and a section of another form but `[default]` is not a
-  # profile.
+  # The profiles of an INI text: `[section]` lines (a comment may follow
+  # them), `name = value` lines under them (names lowercased, values
+  # trimmed), `#` and `;` comment lines. An indented line continues the
+  # setting above it or is one of its sub-settings (`s3 =` then
+  # `  addressing_style = path`): not a setting of the profile. In a
+  # config file (`config`), `[profile name]` is profile `name` and a
+  # section of another form but `[default]` is not a profile.
   def self.parse(text: String, config: Bool) -> Hash[String, Hash[String, String]]
     out = Hash::Builder[String, Hash[String, String]].new
     current: String? = nil
     text.split("\n").each do |raw|
       line = raw.strip
       next if line.empty? || line.start_with?("#") || line.start_with?(";")
-      if line.start_with?("[") && line.end_with?("]")
-        section = line[1, line.size - 2].strip
+      next if raw.start_with?(" ") || raw.start_with?("\t")
+      if m = line.match(/\A\[([^\]]*)\]\s*(?:[#;].*)?\z/)
+        section = m[1].as(String).strip
         current = if !config || section == "default"
                     section
                   elsif section.start_with?("profile ")
@@ -108,7 +111,10 @@ module STS
     if e = env["AWS_ENDPOINT_URL_STS"]? || env["AWS_ENDPOINT_URL"]?
       return e
     end
-    region ? "https://sts.#{region}.amazonaws.com/" : "https://sts.amazonaws.com/"
+    return "https://sts.amazonaws.com/" if region.nil?
+    # (A region is a host label: it names the host the token goes to.)
+    raise CredentialsError.new("not a region: #{region.inspect}") unless region.match?(/\A[a-z0-9]+(-[a-z0-9]+)*\z/)
+    "https://sts.#{region}.amazonaws.com/"
   end
 
   # A session name for a role whose settings give none.
@@ -125,26 +131,27 @@ module STS
       req = SigV4.sign(req, service: "sts", region: region || "us-east-1", credentials: k)
     end
     action = params["Action"]
-    res = begin
-            http.request(req)
-          rescue HTTP::Client::Error => e
-            raise CredentialsError.new("STS #{action} could not be reached (#{e.class.name}: #{e.message})")
-          end
-    body = res.body.read
-    unless res.success?
+    status, body = begin
+                     res = http.request(req)
+                     [res.status, res.body.read]
+                   rescue HTTP::Client::Error => e
+                     raise CredentialsError.new("STS #{action} could not be reached (#{e.class.name}: #{e.message})")
+                   end
+    unless status >= 200 && status <= 299
       f: Hash[String, String] = begin
                                   STSXML.fields(body, ["Code", "Message"])
                                 rescue CredentialsError
                                   {}
                                 end
-      raise CredentialsError.new("STS #{action} answered #{res.status}#{f["Code"]? ? ": #{f["Code"]}" : ""}#{f["Message"]? ? " (#{f["Message"]})" : ""}")
+      raise CredentialsError.new("STS #{action} answered #{status}#{f["Code"]? ? ": #{f["Code"]}" : ""}#{f["Message"]? ? " (#{f["Message"]})" : ""}")
     end
-    f = STSXML.fields(body, [result, "AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"])
+    # (The keys under the result's `Credentials` only.)
+    f = STSXML.fields(body, ["AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"], [result, "Credentials"])
     id = f["AccessKeyId"]?
     secret = f["SecretAccessKey"]?
     token = f["SessionToken"]?
     exp = f["Expiration"]?
-    if !f.key?(result) || id.nil? || secret.nil? || token.nil? || exp.nil? || id.empty? || secret.empty?
+    if id.nil? || secret.nil? || token.nil? || exp.nil? || id.empty? || secret.empty?
       raise CredentialsError.new("STS #{action} answered without the keys")
     end
     Credentials::Keys.new(id, secret, token, Credentials.time(exp, "STS #{action}"))

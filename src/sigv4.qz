@@ -57,8 +57,7 @@ module SigV4
     amz_date = SigV4.amz_date(t)
     hash = SigV4.payload_hash(request, payload_hash, unsigned_payload)
     SigV4.check_length(request)
-    h = request.headers.delete("authorization")
-    h = h.put("host", HTTP::Client.host_header(request.url)) unless h.key?("host")
+    h = SigV4.base_headers(request)
     h = h.put("x-amz-date", amz_date)
     if token = credentials.session_token
       h = h.put("x-amz-security-token", token)
@@ -98,8 +97,7 @@ module SigV4
     t = time.utc
     hash = service == "s3" ? UNSIGNED_PAYLOAD : SigV4.payload_hash(request, nil, false)
     SigV4.check_length(request)
-    h = request.headers.delete("authorization")
-    h = h.put("host", HTTP::Client.host_header(request.url)) unless h.key?("host")
+    h = SigV4.base_headers(request)
     names = SigV4.signed_names(h)
     params = [
       ["X-Amz-Algorithm", ALGORITHM],
@@ -112,8 +110,9 @@ module SigV4
       params = params.push(["X-Amz-Security-Token", token])
     end
     added = params.map { |p| "#{SigV4.encode(p[0])}=#{SigV4.encode(p[1])}" }.join("&")
-    q = request.url.query
-    query = q.nil? || q.empty? ? added : "#{q}&#{added}"
+    # (A query signed before: its signature's parameters dropped.)
+    kept = (request.url.query || "").split("&").reject { |p| p.empty? || p.downcase.start_with?("x-amz-") }
+    query = kept.empty? ? added : "#{kept.join("&")}&#{added}"
     url = request.url.with(query: query)
     parts = SigV4.parts(request.method, url, h, hash, service: service, region: region, credentials: credentials, time: t)
     url.with(query: "#{query}&X-Amz-Signature=#{parts.signature}")
@@ -153,6 +152,12 @@ module SigV4
     # Where the keys come from.
     credentials: Credentials::Provider
   )
+    # `#<AWS::SigV4::Signer kms us-east-1>`: not the provider's state.
+    def inspect -> String = "#<AWS::SigV4::Signer #{service} #{region}>"
+
+    # As `inspect`.
+    def to_s -> String = inspect
+
     # `request` signed now (`SigV4.sign`'s keywords but the three this
     # signer holds).
     def sign(request: HTTP::Client::Request, *, payload_hash: String? = nil, unsigned_payload: Bool = false,
@@ -180,6 +185,16 @@ module SigV4
   def self.amz_date(t: Time) -> String = t.utc.strftime("%Y%m%dT%H%M%SZ")
 
   # :nodoc:
+  # The request's headers to sign: those of a signature made before
+  # dropped (signing again, after a refresh or a clock skew), and `Host`
+  # as the client will send it (from the URL, whatever the request
+  # says).
+  def self.base_headers(request: HTTP::Client::Request) -> HTTP::Headers
+    h = request.headers.delete("authorization").delete("x-amz-date").delete("x-amz-security-token").delete("x-amz-content-sha256")
+    h.put("host", HTTP::Client.host_header(request.url))
+  end
+
+  # :nodoc:
   # The names of the headers signed, lowercased, sorted, once each.
   def self.signed_names(headers: HTTP::Headers) -> Array[String]
     names: Array[String] = []
@@ -190,7 +205,7 @@ module SigV4
   # :nodoc:
   # A header value as signed: without leading and trailing whitespace,
   # each run of spaces one space.
-  def self.trim(value: String) -> String = value.strip.gsub(/ +/, " ")
+  def self.trim(value: String) -> String = value.strip.gsub(/[ \t]+/, " ")
 
   # :nodoc:
   # The hash of the payload (`.sign`).
@@ -213,7 +228,13 @@ module SigV4
     given = request.headers["content-length"]
     return if given.nil?
     size = case request.body
-           in HTTP::Content::Empty then 0
+           in HTTP::Content::Empty
+             # (The client sends `Content-Length: 0` for these only.)
+             m = request.method
+             unless m == "POST" || m == "PUT" || m == "PATCH"
+               raise ArgumentError, "a Content-Length on a #{m} without a body (it is not sent)"
+             end
+             0
            in HTTP::Content::Text(text) then text.bytesize
            in HTTP::Content::Binary(bytes) then bytes.size
            in HTTP::Content::Stream(_)
@@ -233,7 +254,7 @@ module SigV4
     p = path.empty? ? "/" : path
     p = "/#{p}" unless p.start_with?("/")
     if service == "s3"
-      return p.split("/", -1).map { |s| SigV4.encode(URI.decode(s, false) || s) }.join("/")
+      return p.split("/", -1).map { |s| SigV4.encode_bytes(SigV4.decode_bytes(s)) }.join("/")
     end
     p = URI.remove_dot_segments(p.gsub(/\/+/, "/"))
     p = "/" if p.empty?
@@ -250,7 +271,7 @@ module SigV4
     query.split("&").each do |p|
       next if p.empty?
       k, _, v = p.partition("=")
-      pairs = pairs.push([SigV4.encode(URI.decode(k, false) || k), SigV4.encode(URI.decode(v, false) || v)])
+      pairs = pairs.push([SigV4.encode_bytes(SigV4.decode_bytes(k)), SigV4.encode_bytes(SigV4.decode_bytes(v))])
     end
     pairs.sort { |a, b| a[0] == b[0] ? a[1] <=> b[1] : a[0] <=> b[0] }.map { |p| "#{p[0]}=#{p[1]}" }.join("&")
   end
@@ -259,6 +280,50 @@ module SigV4
   # Percent-encoding as SigV4 wants it: `A-Z a-z 0-9 - . _ ~` kept, every
   # other byte `%XY` (upper case).
   def self.encode(text: String) -> String = URI.encode_component(text)
+
+  # :nodoc:
+  # `text`'s bytes with each `%XY` decoded (a `%` without two hexadecimal
+  # digits kept): bytes, not necessarily UTF-8, as the server decodes
+  # them.
+  def self.decode_bytes(text: String) -> Bytes
+    src = text.to_bytes
+    out = Bytes::Builder.new
+    i = 0
+    while i < src.size
+      c = src[i]
+      if c == 37 && i + 2 < src.size && SigV4.hexval(src[i + 1]) >= 0 && SigV4.hexval(src[i + 2]) >= 0
+        out << (SigV4.hexval(src[i + 1]) * 16 + SigV4.hexval(src[i + 2]))
+        i += 3
+      else
+        out << c
+        i += 1
+      end
+    end
+    out.to_bytes
+  end
+
+  # :nodoc:
+  def self.hexval(c: Int) -> Int
+    return c - 48 if c >= 48 && c <= 57
+    return c - 55 if c >= 65 && c <= 70
+    return c - 87 if c >= 97 && c <= 102
+    -1
+  end
+
+  # :nodoc:
+  # `bytes` percent-encoded as `.encode` does a string's.
+  def self.encode_bytes(bytes: Bytes) -> String
+    out = String::Builder.new
+    bytes.each do |c|
+      keep = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126
+      if keep
+        out << c.chr
+      else
+        out << "%" << "0123456789ABCDEF"[c / 16] << "0123456789ABCDEF"[c % 16]
+      end
+    end
+    out.to_s
+  end
 
   # :nodoc:
   def self.hex(bytes: Bytes) -> String
