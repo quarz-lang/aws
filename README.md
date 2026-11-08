@@ -11,6 +11,8 @@ this cog, starting with KMS.
 AWS = { git = "https://github.com/quarz-lang/aws", tag = "v0.1.0" }
 ```
 
+The API reference of the main branch is at <https://aws.api.quarz.dev>.
+
 Work in progress: the design is issue #1. What exists:
 
 ### Credentials
