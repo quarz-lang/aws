@@ -15,7 +15,7 @@ Work in progress: the design is issue #1. What exists:
 
 ### Credentials
 
-```ruby
+```crystal
 creds = AWS::Credentials.default   # a provider: Shareable, cached, refreshed
 keys = creds.get                   # AWS::Credentials::Keys
 keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expires 2026-11-07T12:00:00Z>"
@@ -80,7 +80,7 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
 
 ### Signature Version 4
 
-```ruby
+```crystal
 req = HTTP::Client::Request.post("https://sqs.ap-northeast-1.amazonaws.com/", body: form,
                                  content_type: "application/x-www-form-urlencoded")
 signed = AWS::SigV4.sign(req, service: "sqs", region: "ap-northeast-1", credentials: creds.get)
@@ -110,7 +110,7 @@ documentation's examples, and fake endpoints for every provider.
 
 ### Configuration
 
-```ruby
+```crystal
 config = AWS::Config.new(region: "ap-northeast-1", credentials: AWS::Credentials.default)
 config = AWS::Config.default   # from the environment
 ```
@@ -125,7 +125,7 @@ longest an attempt may take. `Config.default` reads `AWS_REGION`,
 
 ### KMS
 
-```ruby
+```crystal
 kms = AWS::KMS.new(config)   # Shareable: one per program
 
 out = kms.encrypt(key_id: "alias/app", plaintext: secret, encryption_context: {"tenant" => "t1"})
