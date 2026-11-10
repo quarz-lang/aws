@@ -28,6 +28,10 @@ temporary files. The opt-in test against a real KMS reads
 `AWS_TEST_KMS_KEY_ID` and real credentials from the environment
 (`AWS_ENDPOINT_URL_KMS` for a local emulator), and is never run in CI.
 
+Long commands and waits (tests, builds, CI): follow the `long-jobs`
+skill (run them with `run_in_background`, keep the log and `exit=$?`,
+never use `pgrep -f` with a plain pattern).
+
 - Work on a branch and open a pull request (below); stage files by explicit path.
 - Review the branch's diff with a fresh subagent before the pull request
   leaves draft (commits on a draft are fine without it), and fix what it
