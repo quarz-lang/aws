@@ -223,7 +223,7 @@ class KMS
       end
       error = KMS.error(status, headers, text)
       if !skewed && KMS.skew?(error)
-        if server = KMS.http_date(headers["date"])
+        if server = Time.httpdate?(headers["date"] || "")
           # (Corrected when the server's clock is over 4 minutes from
           # ours as corrected so far, either way, as botocore does.)
           diff = (server - Time.now).to_ms
@@ -350,20 +350,6 @@ class KMS
   # Whether the answer may say the request's time is too far from the
   # server's: its code; the server's Date decides.
   def self.skew?(e: ServiceError) -> Bool = SKEW_CODES.include?(e.code)
-
-  # :nodoc:
-  MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
-  # :nodoc:
-  # An HTTP date (`Sat, 07 Nov 2026 12:00:00 GMT`), nil when it is not one.
-  def self.http_date(text: String?) -> Time?
-    t = text || return nil
-    m = t.match(/\A[A-Za-z]{3}, (\d{2}) ([A-Za-z]{3}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT\z/) || return nil
-    month = MONTHS.index(m[2].as(String)) || return nil
-    Time.utc(m[3].as(String).to_i, month + 1, m[1].as(String).to_i, m[4].as(String).to_i, m[5].as(String).to_i, m[6].as(String).to_i)
-  rescue ArgumentError
-    nil
-  end
 
   # Envelope encryption: each secret encrypted locally with AES-256-GCM
   # under a fresh data key from KMS (`generate_data_key`), the data key
