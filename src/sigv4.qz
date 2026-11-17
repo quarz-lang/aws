@@ -198,7 +198,7 @@ module SigV4
   # says).
   def self.base_headers(request: HTTP::Client::Request) -> HTTP::Headers
     h = request.headers.delete("authorization").delete("x-amz-date").delete("x-amz-security-token")
-    h.put("host", HTTP::Client.host_header(request.url))
+    h.put("host", request.host)
   end
 
   # :nodoc:
