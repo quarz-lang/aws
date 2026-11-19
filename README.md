@@ -25,7 +25,7 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
 
 - `AWS::Credentials::Keys(access_key_id, secret_access_key, session_token, expires_at)`:
   `inspect` and `to_s` show the access key id and the expiry only.
-- Providers (`AWS::Credentials::Provider`, `get -> Keys`):
+- Providers ([AWS::Credentials::Provider], `get -> Keys`):
   - `static(access_key_id:, secret_access_key:, session_token: nil)`;
   - `env`: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`;
   - `profile(name)`: `AWS_PROFILE`, else `default`, from
@@ -39,11 +39,11 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
     instead of `source_profile`, the role's keys are had with those of
     `env` (`Environment`), `instance` (`Ec2InstanceMetadata`) or
     `container` (`EcsContainer`); another value, or both settings
-    (mutually exclusive, as in the SDKs), raises `AWS::ProfileError`
+    (mutually exclusive, as in the SDKs), raises [AWS::ProfileError]
     before any request. A profile named by
     `AWS_PROFILE` (or given), or one with `role_arn` (the default one
-    included), whose keys cannot be had raises `AWS::ProfileError`
-    (`AWS::ProfileNotFound` when neither file has it), which stops a
+    included), whose keys cannot be had raises [AWS::ProfileError]
+    ([AWS::ProfileNotFound] when neither file has it), which stops a
     chain rather than find other keys;
   - `container`: ECS and EKS Pod Identity,
     `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `_FULL_URI` (https on any
@@ -57,26 +57,26 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
     `AWS_WEB_IDENTITY_TOKEN_FILE` (read at each refresh), `AWS_ROLE_ARN`,
     `AWS_ROLE_SESSION_NAME`;
   - `chain(providers)`: the first that answers, tried in order until
-    one does (`CredentialsError` names what each said). Once one has
+    one does ([AWS::CredentialsError] names what each said). Once one has
     answered, it is the chain's: its later failure is the chain's error,
     never other keys of another identity. A profile named by
     `AWS_PROFILE`, or the default one when it has `role_arn`, that cannot
-    give keys stops the chain (`AWS::ProfileError`);
+    give keys stops the chain ([AWS::ProfileError]);
   - `default`: `chain([env, web_identity, profile, container, instance])`.
 - Temporary keys are cached and refreshed 5 minutes before they expire,
   by one task at a time (the others go on with the kept keys, or wait
   for the new ones); a failed refresh keeps the old keys until they
-  expire, then raises `AWS::CredentialsError`. A refresh that failed, or
+  expire, then raises [AWS::CredentialsError]. A refresh that failed, or
   brought keys already within the 5 minutes, is not tried again for 10
   seconds. Any error a
-  provider meets is a `CredentialsError`; none follows redirects.
+  provider meets is an [AWS::CredentialsError]; none follows redirects.
 - `inspect` of a provider names it (`#<AWS::Credentials environment>`),
   never what it holds.
 - STS is reached at `AWS_ENDPOINT_URL_STS` or `AWS_ENDPOINT_URL` when
   set, else its regional endpoint (`AWS_REGION`, `AWS_DEFAULT_REGION`,
   the profile's `region`), the global one without a region.
 - For tests, the providers take `env:` (a hash in place of `ENV`) and
-  `http:` (an `HTTP::Client`); `container` and `instance` take `base:`,
+  `http:` (an [HTTP::Client]); `container` and `instance` take `base:`,
   the endpoint's base URL.
 - `AWS::Profiles.region(name)`: a profile's region.
 
@@ -103,7 +103,7 @@ signer = AWS::SigV4::Signer.new("kms", "us-east-1", creds)   # signer.sign(req)
   for every service but S3, whose paths are signed as they are.
 - `presign` signs in the query (`X-Amz-Algorithm`, `-Credential`,
   `-Date`, `-Expires`, `-SignedHeaders`, `-Security-Token`, `-Signature`).
-- `SigV4.parts` gives each stage (canonical request, string to sign,
+- [AWS::SigV4.parts] gives each stage (canonical request, string to sign,
   signature).
 
 Tested against the official SigV4 test suite (`test/fixtures/sigv4/`,
@@ -121,8 +121,8 @@ config = AWS::Config.default   # from the environment
 the region, the credentials provider, an endpoint for every service
 (a local emulator) or one per service, the HTTP client, the retries
 (full-jitter backoff up to `min(retry_cap, retry_base * 2**n)`) and the
-longest an attempt may take. `Config.default` reads `AWS_REGION`,
-`AWS_DEFAULT_REGION` or the profile's `region`, `Credentials.default`,
+longest an attempt may take. [AWS::Config.default] reads `AWS_REGION`,
+`AWS_DEFAULT_REGION` or the profile's `region`, [AWS::Credentials.default],
 `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_<SERVICE>` (`AWS_ENDPOINT_URL_KMS`).
 
 ### KMS
@@ -152,16 +152,16 @@ box.open(sealed)
   `get_public_key`, `describe_key`, `generate_random`; keyword
   arguments in snake_case, enumerations as symbols (`:aes_256`,
   `:rsassa_pss_sha_256`, `message_type: :digest`), answers as `data`
-  values with `Bytes` for the base64 fields (`inspect` leaves
+  values with [Bytes] for the base64 fields (`inspect` leaves
   plaintexts out).
 - Throttling (`ThrottlingException`, 429), 5xx answers,
   `KMSInternalException`, `DependencyTimeoutException` and transport
   errors are tried again (every operation here is safe to send twice);
   an answer that may mean a clock skew (`InvalidSignatureException`,
   `SignatureDoesNotMatch`, `RequestExpired`, `RequestInTheFuture`,
-  `RequestTimeTooSkewed`) with a `Date` over 4 minutes from ours is tried
+  `RequestTimeTooSkewed`) with a [Date] over 4 minutes from ours is tried
   once more with the server's time, which later requests keep.
-- Requests follow no redirect (`Config.client`, the default): a
+- Requests follow no redirect ([AWS::Config.client], the default): a
   redirect would take the body (a plaintext) elsewhere. The region must
   be a host label.
 - `KMS::Envelope.new(kms, key_id, encryption_context, allowed_keys =
@@ -201,20 +201,20 @@ box.open(sealed)
 
 ### Errors
 
-- `AWS::Error`, the root of the errors this cog raises;
-  `AWS::CredentialsError`, no credentials could be had (the message
-  says what was tried, never a key); `AWS::ServiceError`, a service's
+- [AWS::Error], the root of the errors this cog raises;
+  [AWS::CredentialsError], no credentials could be had (the message
+  says what was tried, never a key); [AWS::ServiceError], a service's
   error: `code` (`NotFoundException`, the service's prefix dropped:
   match on it), `detail` (its message), `status`, `request_id`;
-  `AWS::TransportError`, a request that could not be made or answered
-  (the `HTTP::Client::Error`'s class in the message). No message holds
+  [AWS::TransportError], a request that could not be made or answered
+  (the [HTTP::Client::Error]'s class in the message). No message holds
   a request's body or keys.
 
 ### Not there yet
 
 Other services (S3, SQS, STS beyond the credentials), presigned S3
-uploads beyond `SigV4.presign` itself, a data-key cache for
-`KMS::Envelope`.
+uploads beyond [AWS::SigV4.presign] itself, a data-key cache for
+[AWS::KMS::Envelope].
 
 ### Tests
 

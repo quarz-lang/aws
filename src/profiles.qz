@@ -12,7 +12,7 @@
 # ```
 module Profiles
   # The settings of profile `name`, nil when neither file has it (`env`
-  # gives the files' paths and HOME). Raises `CredentialsError` for a
+  # gives the files' paths and HOME). Raises [CredentialsError] for a
   # file that cannot be read.
   def self.settings(name: String, env: Hash[String, String] = ENV) -> Hash[String, String]?
     config = Profiles.read(Profiles.config_path(env), true)[name]?
@@ -22,7 +22,7 @@ module Profiles
   end
 
   # The region of profile `name` (AWS_PROFILE, else `default`), nil
-  # when it has none. Raises `CredentialsError` as `.settings` does.
+  # when it has none. Raises [CredentialsError] as [.settings] does.
   def self.region(name: String? = nil, env: Hash[String, String] = ENV) -> String?
     p = env["AWS_PROFILE"]?
     s = Profiles.settings(name || (p && !p.empty? ? p : nil) || "default", env)
