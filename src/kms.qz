@@ -15,11 +15,11 @@ require "crypto"
 #
 # Each operation sends KMS's JSON 1.1 protocol (`POST /` with
 # `X-Amz-Target: TrentService.<Operation>`), signed with SigV4, and
-# returns a `data` value with KMS's fields in snake_case (`Bytes` for the
-# base64 ones). KMS's errors raise `AWS::ServiceError` (match on `code`:
+# returns a `data` value with KMS's fields in snake_case ([Bytes] for the
+# base64 ones). KMS's errors raise [AWS::ServiceError] (match on `code`:
 # NotFoundException, AccessDeniedException, ...); a connection that
-# fails, `AWS::TransportError`. Throttling, 5xx answers and transport
-# errors are tried again (`Config#retries`, with full-jitter backoff);
+# fails, [AWS::TransportError]. Throttling, 5xx answers and transport
+# errors are tried again ([Config#retries], with full-jitter backoff);
 # an answer saying the clock is off is tried once more with the server's
 # time. Enumerations are symbols: `key_spec: :aes_256`,
 # `signing_algorithm: :rsassa_pss_sha_256`, `message_type: :digest`.
@@ -41,22 +41,22 @@ class KMS
   # `encrypt`'s answer.
   data EncryptOutput = (ciphertext_blob: Bytes, key_id: String, encryption_algorithm: String)
 
-  # `decrypt`'s answer. `inspect` leaves the plaintext out.
+  # `decrypt`'s answer. [inspect] leaves the plaintext out.
   data DecryptOutput(plaintext: Bytes, key_id: String, encryption_algorithm: String)
     # `#<AWS::KMS::DecryptOutput key_id>`.
     def inspect -> String = "#<AWS::KMS::DecryptOutput #{key_id}>"
 
-    # As `inspect`.
+    # As [inspect].
     def to_s -> String = inspect
   end
 
   # `generate_data_key`'s answer: the key in plaintext and as encrypted
-  # under the KMS key. `inspect` leaves the plaintext out.
+  # under the KMS key. [inspect] leaves the plaintext out.
   data DataKey(plaintext: Bytes, ciphertext_blob: Bytes, key_id: String)
     # `#<AWS::KMS::DataKey key_id>`.
     def inspect -> String = "#<AWS::KMS::DataKey #{key_id}>"
 
-    # As `inspect`.
+    # As [inspect].
     def to_s -> String = inspect
   end
 
@@ -67,7 +67,7 @@ class KMS
   data SignOutput = (signature: Bytes, key_id: String, signing_algorithm: String)
 
   # `get_public_key`'s answer: the public key as DER (SubjectPublicKeyInfo;
-  # `Crypto::RSA::PublicKey.from_der` reads an RSA one).
+  # [Crypto::RSA::PublicKey.from_der] reads an RSA one).
   data PublicKey = (public_key: Bytes, key_id: String, key_spec: String, key_usage: String,
                     signing_algorithms: Array[String], encryption_algorithms: Array[String])
 
@@ -83,7 +83,7 @@ class KMS
     # `#<AWS::KMS::RandomOutput 32 bytes>`.
     def inspect -> String = "#<AWS::KMS::RandomOutput #{plaintext.size} bytes>"
 
-    # As `inspect`.
+    # As [inspect].
     def to_s -> String = inspect
   end
 
@@ -93,7 +93,7 @@ class KMS
   # they differ.
   @skew: Atom[Int]
 
-  # A client for `config`'s region and credentials, at
+  # A client for [config]'s region and credentials, at
   # `config.endpoint_for("kms")`.
   def initialize(@config: Config)
     @endpoint = config.endpoint_for("kms")
@@ -109,7 +109,7 @@ class KMS
   # `#<AWS::KMS https://kms.ap-northeast-1.amazonaws.com>`.
   def inspect -> String = "#<AWS::KMS #{@endpoint}>"
 
-  # As `inspect`.
+  # As [inspect].
   def to_s -> String = inspect
 
   # `plaintext` (up to 4096 bytes) encrypted under `key_id` (an id, an
@@ -358,10 +358,10 @@ class KMS
   # encrypt (opening one decrypts its data key through KMS). Nothing is
   # cached but the key an alias or a bare key id names (`RESOLVED_FOR`).
   #
-  # A sealed value is one `Bytes`: a version byte (1); the length of the
+  # A sealed value is one [Bytes]: a version byte (1); the length of the
   # KMS key's ARN (one byte) and the ARN, as `generate_data_key` gave it
-  # (`open` decrypts under that key, when it accepts it: the key `key_id`
-  # names, or one of `allowed_keys`); the encrypted data key's length
+  # ([open] decrypts under that key, when it accepts it: the key [key_id]
+  # names, or one of [allowed_keys]); the encrypted data key's length
   # (two bytes, big-endian) and the key; the 12-byte nonce; then the
   # ciphertext and its 16-byte tag. The bytes before the ciphertext are
   # its additional authenticated data, so that none of them can be
@@ -382,7 +382,7 @@ class KMS
     # The encryption context each data key is bound to (and must be given
     # again to open).
     encryption_context: Hash[String, String] = Hash[String, String].new,
-    # The key ARNs `open` accepts besides the one `key_id` names (that of
+    # The key ARNs [open] accepts besides the one [key_id] names (that of
     # an alias's previous key, once it was moved).
     allowed_keys: Array[String] = Array[String].new,
     # :nodoc:
@@ -419,14 +419,14 @@ class KMS
     end
 
     # The plaintext of `sealed`, its data key decrypted through KMS
-    # under the key the header names, when that is the key `key_id` names
-    # (an alias followed if it moved) or one of `allowed_keys`.
+    # under the key the header names, when that is the key [key_id] names
+    # (an alias followed if it moved) or one of [allowed_keys].
     #
     # ## Raises
     #
-    # `ArgumentError` when `allowed_keys` holds what is not a key ARN.
-    # `AWS::Error` for bytes that are not a sealed value of this format,
-    # were altered, or name a key not accepted: `AWS::ServiceError`, a
+    # [ArgumentError] when [allowed_keys] holds what is not a key ARN.
+    # [AWS::Error] for bytes that are not a sealed value of this format,
+    # were altered, or name a key not accepted: [AWS::ServiceError], a
     # subclass, when KMS will not
     # decrypt the data key (another encryption context, an altered key
     # or ARN).
@@ -488,7 +488,7 @@ class KMS
     # `#<AWS::KMS::Envelope alias/app>`.
     def inspect -> String = "#<AWS::KMS::Envelope #{key_id}>"
 
-    # As `inspect`.
+    # As [inspect].
     def to_s -> String = inspect
   end
 end
