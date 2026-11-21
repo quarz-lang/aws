@@ -41,8 +41,10 @@ class KMS
   # `encrypt`'s answer.
   data EncryptOutput = (ciphertext_blob: Bytes, key_id: String, encryption_algorithm: String)
 
-  # `decrypt`'s answer. [inspect] leaves the plaintext out.
-  data DecryptOutput(plaintext: Bytes, key_id: String, encryption_algorithm: String)
+  # `decrypt`'s answer. The plaintext is a [Bytes::Secret], decoded
+  # straight into it from the answer's Base64 (`wipe` it when done; the
+  # answer's text itself is not cleared). [inspect] leaves it out.
+  data DecryptOutput(plaintext: Bytes::Secret, key_id: String, encryption_algorithm: String)
     # `#<AWS::KMS::DecryptOutput key_id>`.
     def inspect -> String = "#<AWS::KMS::DecryptOutput #{key_id}>"
 
@@ -50,9 +52,10 @@ class KMS
     def to_s -> String = inspect
   end
 
-  # `generate_data_key`'s answer: the key in plaintext and as encrypted
-  # under the KMS key. [inspect] leaves the plaintext out.
-  data DataKey(plaintext: Bytes, ciphertext_blob: Bytes, key_id: String)
+  # `generate_data_key`'s answer: the key in plaintext, a
+  # [Bytes::Secret] (as [DecryptOutput]'s), and as encrypted under the KMS
+  # key. [inspect] leaves the plaintext out.
+  data DataKey(plaintext: Bytes::Secret, ciphertext_blob: Bytes, key_id: String)
     # `#<AWS::KMS::DataKey key_id>`.
     def inspect -> String = "#<AWS::KMS::DataKey #{key_id}>"
 
@@ -137,7 +140,7 @@ class KMS
       body = body.merge({"EncryptionAlgorithm" => KMS.enum(a)})
     end
     r = call("Decrypt", body)
-    DecryptOutput.new(KMS.bytes(r, "Plaintext"), KMS.str(r, "KeyId"), KMS.str(r, "EncryptionAlgorithm"))
+    DecryptOutput.new(KMS.secret(r, "Plaintext"), KMS.str(r, "KeyId"), KMS.str(r, "EncryptionAlgorithm"))
   end
 
   # A data key (`key_spec` `:aes_256` or `:aes_128`, or `number_of_bytes`)
@@ -146,7 +149,7 @@ class KMS
                         encryption_context: Hash[String, String] = Hash[String, String].new,
                         grant_tokens: Array[String] = Array[String].new) -> DataKey
     r = call("GenerateDataKey", KMS.data_key_fields(key_id, key_spec, number_of_bytes, encryption_context, grant_tokens))
-    DataKey.new(KMS.bytes(r, "Plaintext"), KMS.bytes(r, "CiphertextBlob"), KMS.str(r, "KeyId"))
+    DataKey.new(KMS.secret(r, "Plaintext"), KMS.bytes(r, "CiphertextBlob"), KMS.str(r, "KeyId"))
   end
 
   # A data key encrypted under `key_id` only (decrypt it when it is to
@@ -323,6 +326,15 @@ class KMS
   end
 
   # :nodoc:
+  # As [bytes], decoded straight into a [Bytes::Secret].
+  def self.secret(v: JSON::Value, name: String) -> Bytes::Secret
+    s = v[name]?&.as_s? || raise ServiceError.new(code: "MalformedAnswer", message: "an answer without #{name}", status: 200)
+    Base64.decode_secret(s)
+  rescue ArgumentError
+    raise ServiceError.new(code: "MalformedAnswer", message: "#{name} is not base64", status: 200)
+  end
+
+  # :nodoc:
   # The `ServiceError` of an answer: the code from the body's `__type`
   # or the `x-amzn-ErrorType` header, the service's prefix dropped
   # (`com.amazonaws.kms#NotFoundException`, `NotFoundException:http://...`).
@@ -415,7 +427,13 @@ class KMS
       raise Error.new("an encrypted data key of #{blob.size} bytes") if blob.empty? || blob.size > 65_535
       nonce = Crypto.random_bytes(NONCE_SIZE)
       head = Bytes[VERSION, arn.size] + arn + Bytes[blob.size / 256, blob.size % 256] + blob + nonce
-      head + Crypto::AES::GCM.new(dk.plaintext).seal(nonce, plaintext, aad: head)
+      # The data key lives in the cipher only while it seals, then both
+      # are wiped.
+      gcm = Crypto::AES::GCM.new(dk.plaintext)
+      dk.plaintext.wipe
+      sealed = gcm.seal(nonce, plaintext, aad: head)
+      gcm.wipe
+      head + sealed
     end
 
     # The plaintext of `sealed`, its data key decrypted through KMS
@@ -445,9 +463,17 @@ class KMS
       head = sealed.slice(0, rest)
       accept!(arn)
       key = kms.decrypt(ciphertext_blob: blob, encryption_context: encryption_context, key_id: arn).plaintext
-      raise Error.new("not a sealed value: a data key of #{key.size} bytes") unless key.size == 32
-      Crypto::AES::GCM.new(key).open?(nonce, sealed.slice(rest, sealed.size - rest), aad: head) ||
-        raise Error.new("the sealed value was altered")
+      unless key.size == 32
+        key.wipe
+        raise Error.new("not a sealed value: a data key of #{key.size} bytes")
+      end
+      # As in [seal]: the data key wiped once the cipher holds it, the
+      # cipher once it has opened.
+      gcm = Crypto::AES::GCM.new(key)
+      key.wipe
+      opened = gcm.open?(nonce, sealed.slice(rest, sealed.size - rest), aad: head)
+      gcm.wipe
+      opened || raise Error.new("the sealed value was altered")
     end
 
     # Refuses `arn` unless it is the key `key_id` names (an alias or a
