@@ -17,7 +17,7 @@ class KMSRealTest < Test::Case
     client = kms
     ctx = {"purpose" => "quarz-aws-test"}
     out = client.encrypt(key_id: k, plaintext: "hello", encryption_context: ctx)
-    assert_equal(b"hello", client.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: ctx).plaintext)
+    assert_equal(b"hello", client.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: ctx).plaintext.expose_bytes)
     dk = client.generate_data_key(key_id: k, encryption_context: ctx)
     assert_equal(32, dk.plaintext.size)
     box = AWS::KMS::Envelope.new(client, k, ctx)

@@ -131,9 +131,9 @@ longest an attempt may take. [AWS::Config.default] reads `AWS_REGION`,
 kms = AWS::KMS.new(config)   # Shareable: one per program
 
 out = kms.encrypt(key_id: "alias/app", plaintext: secret, encryption_context: {"tenant" => "t1"})
-kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: {"tenant" => "t1"}).plaintext
+kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: {"tenant" => "t1"}).plaintext   # a Bytes::Secret: wipe it when done
 
-dk = kms.generate_data_key(key_id: "alias/app", key_spec: :aes_256)   # dk.plaintext, dk.ciphertext_blob
+dk = kms.generate_data_key(key_id: "alias/app", key_spec: :aes_256)   # dk.plaintext (a Bytes::Secret), dk.ciphertext_blob
 sig = kms.sign(key_id: "alias/sign", message: bytes, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256).signature
 kms.verify(key_id: "alias/sign", message: bytes, signature: sig, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256)   # => Bool
 pub = kms.get_public_key(key_id: "alias/sign")                 # pub.public_key: DER, Crypto::RSA::PublicKey.from_der
