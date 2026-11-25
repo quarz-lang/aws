@@ -14,22 +14,28 @@ module STSXML
   # "Credentials"]`), by that name; the first one wins. Raises
   # `CredentialsError` on what it does not read.
   def self.fields(xml: String, names: Array[String], within: Array[String] = []) -> Hash[String, String]
+    # (Walked once, by bytes: the syntax looked for is ASCII, which never
+    # occurs inside a UTF-8 sequence, so a cut there is a character
+    # boundary. Indexing the String by character costs the position, and
+    # made the walk quadratic in the answer's length: aws#24.)
+    b = xml.to_bytes
     out = Hash::Builder[String, String].new
     stack: Array[String] = []
     text = String::Builder.new
     rooted = false
+    lead = xml.bytesize - xml.lstrip.bytesize
     i = 0
-    n = xml.size
+    n = b.size
     while i < n
-      c = xml[i, 1]
-      if c == "<" && xml[i, 4] == "<!--"
-        close = (xml.index("-->", i + 4) || STSXML.refuse("an unterminated comment")) + 2
+      c = b[i]
+      if c == LT && i + 3 < n && b[i + 1] == BANG && b[i + 2] == DASH && b[i + 3] == DASH
+        close = (b.index(b"-->", i + 4) || STSXML.refuse("an unterminated comment")) + 2
         i = close + 1
-      elsif c == "<"
-        close = STSXML.tag_end(xml, i + 1)
-        tag = xml[i + 1, close - i - 1]
+      elsif c == LT
+        close = STSXML.tag_end(b, i + 1)
+        tag = b.slice(i + 1, close - i - 1).decode
         if tag.start_with?("?")
-          STSXML.refuse("a processing instruction") unless i == STSXML.lead(xml) && tag.start_with?("?xml ") && tag.end_with?("?")
+          STSXML.refuse("a processing instruction") unless i == lead && tag.start_with?("?xml ") && tag.end_with?("?")
         elsif tag.start_with?("!")
           STSXML.refuse("a DOCTYPE or CDATA section")
         elsif tag.start_with?("/")
@@ -57,15 +63,19 @@ module STSXML
           text = String::Builder.new
         end
         i = close + 1
-      elsif c == "&"
-        semi = xml.index(";", i) || STSXML.refuse("an unterminated entity")
+      elsif c == AMP
+        semi = b.index(b";", i) || STSXML.refuse("an unterminated entity")
         STSXML.refuse("an entity outside the root") if stack.empty?
-        text << STSXML.entity(xml[i + 1, semi - i - 1])
+        text << STSXML.entity(b.slice(i + 1, semi - i - 1).decode)
         i = semi + 1
       else
-        STSXML.refuse("text outside the root") if stack.empty? && !c.strip.empty?
-        text << c
-        i += 1
+        # The text up to the next `<` or `&`, at once.
+        j = i
+        j += 1 while j < n && b[j] != LT && b[j] != AMP
+        run = b.slice(i, j - i).decode
+        STSXML.refuse("text outside the root") if stack.empty? && !run.strip.empty?
+        text << run
+        i = j
       end
     end
     STSXML.refuse("no root element") unless rooted
@@ -74,20 +84,30 @@ module STSXML
   end
 
   # :nodoc:
+  # Bytes the reader looks for.
+  LT = 60
+  GT = 62
+  AMP = 38
+  BANG = 33
+  DASH = 45
+  QUOT = 34
+  APOS = 39
+
+  # :nodoc:
   # Where the tag that starts at `from` (after its `<`) ends: its `>`
-  # outside quoted attribute values.
-  def self.tag_end(xml: String, from: Int) -> Int
-    quote: String? = nil
+  # outside quoted attribute values (a byte index of `b`).
+  def self.tag_end(b: Bytes, from: Int) -> Int
+    quote = -1
     i = from
-    while i < xml.size
-      c = xml[i, 1]
-      if q = quote
-        quote = nil if c == q
-      elsif c == "\"" || c == "'"
+    while i < b.size
+      c = b[i]
+      if quote >= 0
+        quote = -1 if c == quote
+      elsif c == QUOT || c == APOS
         quote = c
-      elsif c == "<"
+      elsif c == LT
         STSXML.refuse("a `<` in a tag")
-      elsif c == ">"
+      elsif c == GT
         return i
       end
       i += 1
@@ -107,10 +127,6 @@ module STSXML
   def self.refuse(what: String) -> Nothing
     raise CredentialsError.new("STS answered XML this reader does not take: #{what}")
   end
-
-  # :nodoc:
-  # Where the document starts, past leading whitespace.
-  def self.lead(xml: String) -> Int = xml.size - xml.lstrip.size
 
   # :nodoc:
   def self.local(name: String) -> String
