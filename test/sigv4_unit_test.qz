@@ -145,6 +145,18 @@ class SigV4ReviewFixesTest < Test::Case
     assert_equal(1, (twice.query || "").split("&").count { |p| p.start_with?("X-Amz-Signature=") })
   end
 
+  # aws#26: a signature parameter whose name is percent-encoded in the
+  # caller's query is dropped too, as the server decodes it; other
+  # encoded names are kept.
+  def test_presign_drops_encoded_signature_parameters
+    req = HTTP::Client::Request.get("https://example.amazonaws.com/?X-Amz-%45xpires=604800&x%2Damz%2Dsignature=00&a%62c=1&%E9=2")
+    url = AWS::SigV4.presign(req, service: "s", region: "r", credentials: keys, expires_in: 1.minute)
+    pairs = (url.query || "").split("&")
+    assert_equal(["a%62c=1", "%E9=2"], pairs.reject { |p| p.start_with?("X-Amz-") })
+    assert_equal(["X-Amz-Expires=60"], pairs.select { |p| p.downcase.start_with?("x-amz-expires") })
+    assert_equal(1, pairs.count { |p| p.downcase.include?("signature") && !p.start_with?("X-Amz-SignedHeaders=") })
+  end
+
   def test_bytes_that_are_not_utf8
     assert_equal("a=%25zz&b=%E9", AWS::SigV4.canonical_query("a=%zz&b=%E9"))
     assert_equal("/%E9", AWS::SigV4.canonical_path("/%E9", "s3"))

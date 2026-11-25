@@ -112,7 +112,7 @@ module SigV4
     end
     added = params.map { |p| "#{SigV4.encode(p[0])}=#{SigV4.encode(p[1])}" }.join("&")
     # (A query signed before: its signature's parameters dropped.)
-    kept = (request.url.query || "").split("&").reject { |p| p.empty? || PRESIGN_PARAMS.include?(p.partition("=")[0].downcase) }
+    kept = (request.url.query || "").split("&").reject { |p| p.empty? || SigV4.presign_param?(p) }
     query = kept.empty? ? added : "#{kept.join("&")}&#{added}"
     url = request.url.with(query: query)
     parts = SigV4.parts(request.method, url, h, hash, service: service, region: region, credentials: credentials, time: t)
@@ -187,6 +187,15 @@ module SigV4
   # made before are dropped, the caller's other `x-amz-*` ones kept.
   PRESIGN_PARAMS = ["x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-expires", "x-amz-signedheaders",
                     "x-amz-security-token", "x-amz-signature"]
+
+  # :nodoc:
+  # Whether the query pair `pair` (`name=value`, as written) sets one of
+  # `PRESIGN_PARAMS`: its name compared decoded, as the server reads it,
+  # so that `X-Amz-%45xpires` is one too (aws#26).
+  def self.presign_param?(pair: String) -> Bool
+    name = SigV4.decode_bytes(pair.partition("=")[0]).decode?
+    !name.nil? && PRESIGN_PARAMS.include?(name.downcase)
+  end
 
   # :nodoc:
   def self.amz_date(t: Time) -> String = t.utc.strftime("%Y%m%dT%H%M%SZ")
