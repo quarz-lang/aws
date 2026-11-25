@@ -150,7 +150,9 @@ module STS
     action = params["Action"]
     status, body = begin
                      res = http.request(req)
-                     [res.status, res.body.read]
+                     [res.status, res.body.read(max: Credentials::MAX_ANSWER_BYTES)]
+                   rescue HTTP::Client::ResponseTooLarge
+                     raise CredentialsError.new("STS #{action} answered more than #{Credentials::MAX_ANSWER_BYTES} bytes")
                    rescue HTTP::Client::Error => e
                      raise CredentialsError.new("STS #{action} could not be reached (#{e.class.name}: #{e.message})")
                    end
