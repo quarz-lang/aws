@@ -117,9 +117,10 @@ config = AWS::Config.new(region: "ap-northeast-1", credentials: AWS::Credentials
 config = AWS::Config.default   # from the environment
 ```
 
-`AWS::Config(region:, credentials:, endpoint: nil, http: HTTP::Client.default, retries: 3, timeout: 30.seconds, retry_base: 100.milliseconds, retry_cap: 20.seconds, service_endpoints: {})`:
+`AWS::Config(region:, credentials:, endpoint: nil, http: AWS::Config.client, retries: 3, timeout: 30.seconds, retry_base: 100.milliseconds, retry_cap: 20.seconds, service_endpoints: {})`:
 the region, the credentials provider, an endpoint for every service
-(a local emulator) or one per service, the HTTP client, the retries
+(a local emulator) or one per service, the HTTP client (by default
+[AWS::Config.client], which follows no redirect), the retries
 (full-jitter backoff up to `min(retry_cap, retry_base * 2**n)`) and the
 longest an attempt may take. [AWS::Config.default] reads `AWS_REGION`,
 `AWS_DEFAULT_REGION` or the profile's `region`, [AWS::Credentials.default],
