@@ -70,6 +70,15 @@ class S3
                            metadata: Hash[String, String], object_lock_mode: Symbol?, object_lock_retain_until_date: Time?,
                            object_lock_legal_hold: Bool?, checksum: Checksum?)
 
+  # An object of a listing ([S3#list_objects_v2]): its key (decoded:
+  # exactly the key), size in bytes, ETag (as S3 gives it, quoted) and
+  # last modification.
+  data ObjectSummary = (key: String, size: Int, etag: String, last_modified: Time?)
+
+  # `list_objects_v2`'s answer: the page's objects, in S3's order (by
+  # key, UTF-8 bytes), and the token for the next page (nil on the last).
+  data ListObjectsV2Output = (objects: Array[ObjectSummary], next_continuation_token: String?)
+
   # `get_object`'s object is larger than its `max_bytes`: raised from
   # its `Content-Length` before the body is read (or while reading, past
   # the bound), not tried again.
@@ -101,6 +110,10 @@ class S3
   # The most bytes read of an answer that is a document (an error, or
   # `put_object`'s empty body).
   ANSWER_LIMIT = 65_536
+  # The most bytes read of a listing: a full page (1000 keys of up to
+  # 1024 bytes, each byte encoded as `%XX`, with their sizes, ETags,
+  # dates and storage classes) is under 4 MiB.
+  LIST_LIMIT = 4 * 1024 * 1024
   # The codes tried again, besides the 5xx statuses and 429 (S3's
   # `RequestTimeout` is a 400 the SDKs try again).
   RETRIED_CODES = ["SlowDown", "InternalError", "ServiceUnavailable", "RequestTimeout"]
@@ -308,6 +321,132 @@ class S3
                          S3.metadata_of(h), S3.lock_mode(h), S3.retain_until(h), S3.legal_hold(h), S3.checksum_of(h))
   end
 
+  # One page of the keys of `bucket` under `prefix` (all keys without
+  # one): one request. `continuation_token` is the previous page's
+  # `next_continuation_token`; `max_keys` (1 to 1000) bounds the page (S3
+  # gives up to 1000 by default, and may give fewer). A caller loops while
+  # `next_continuation_token` is not nil:
+  #
+  # ```quarz no_run
+  # token: String? = nil
+  # loop do
+  #   page = s3.list_objects_v2(bucket: "exports-123456789012", prefix: "daily/", continuation_token: token)
+  #   page.objects.each { |o| puts o.key }
+  #   token = page.next_continuation_token
+  #   break if token.nil?
+  # end
+  # ```
+  #
+  # The request asks for `encoding-type=url`, so that a key holding a
+  # character XML 1.0 cannot carry still comes back, and each key is
+  # decoded: it is exactly the key. (An answer that does not say it is so
+  # encoded, from a store that ignores the parameter, is taken as it is.)
+  # The answer is read within [LIST_LIMIT] bytes.
+  #
+  # ## Raises
+  #
+  # [ArgumentError] before anything is sent (a bucket name S3's rules
+  # refuse, `max_keys` outside 1 to 1000, an owner that is not 12 digits,
+  # an empty token); [ServiceError] for S3's errors (`NoSuchBucket`,
+  # `AccessDenied`) and an answer this client cannot read
+  # (`MalformedAnswer`); [WrongRegion]; [TransportError] when no answer
+  # came or it was larger than [LIST_LIMIT].
+  def list_objects_v2(*, bucket: String, prefix: String? = nil, continuation_token: String? = nil, max_keys: Int? = nil,
+                      expected_bucket_owner: String? = nil) -> ListObjectsV2Output
+    req = list_request(bucket: bucket, prefix: prefix, continuation_token: continuation_token, max_keys: max_keys,
+                       expected_bucket_owner: expected_bucket_owner)
+    answer = @transport.send(req, "S3 ListObjectsV2", ANSWER_LIMIT, ->(status: Int, h: HTTP::Headers, text: String) { S3.error(status, h, text) },
+                             success_limit: LIST_LIMIT)
+    S3.listing(answer.text("S3 ListObjectsV2"))
+  end
+
+  # :nodoc:
+  # The unsigned GET `list_objects_v2` sends, its arguments checked.
+  def list_request(*, bucket: String, prefix: String? = nil, continuation_token: String? = nil, max_keys: Int? = nil,
+                   expected_bucket_owner: String? = nil) -> HTTP::Client::Request
+    S3.check_bucket(bucket)
+    query = ["list-type=2", "encoding-type=url"]
+    if (p = prefix)
+      query = query.push("prefix=#{SigV4.encode(p)}") unless p.empty?
+    end
+    if (t = continuation_token)
+      raise ArgumentError.new("continuation_token: empty") if t.empty?
+      query = query.push("continuation-token=#{SigV4.encode(t)}")
+    end
+    if (m = max_keys)
+      raise ArgumentError.new("max_keys: 1 to 1000, not #{m}") unless m >= 1 && m <= 1000
+      query = query.push("max-keys=#{m}")
+    end
+    req = HTTP::Client::Request.get(bucket_url(bucket).with(query: query.join("&")))
+    if owner = expected_bucket_owner
+      raise ArgumentError.new("expected_bucket_owner: an account id of 12 digits") unless owner.match?(/\A[0-9]{12}\z/)
+      req = req.header("x-amz-expected-bucket-owner", owner)
+    end
+    req
+  end
+
+  # :nodoc:
+  # A listing's document as its output. Raises [ServiceError]
+  # "MalformedAnswer" for one this client cannot read.
+  def self.listing(text: String) -> ListObjectsV2Output
+    malformed = ->(what: String) { ServiceError.new(code: "MalformedAnswer", message: "S3 ListObjectsV2 answered #{what}", status: 200) }
+    top: Hash[String, String] = {}
+    entries: Array[Hash[String, String]] = []
+    begin
+      top = XML.fields(text, ["IsTruncated", "NextContinuationToken", "EncodingType"], ["ListBucketResult"])
+      entries = XML.each_element(text, "Contents", ["Key", "Size", "ETag", "LastModified"], ["ListBucketResult"])
+    rescue XML::Refused => e
+      raise malformed.call("XML this client does not take: #{e.message}")
+    end
+    encoded = top["EncodingType"]? == "url"
+    objects = entries.map do |f|
+      raw = f["Key"]? || raise(malformed.call("an object without a key"))
+      size = f["Size"]? || ""
+      raise malformed.call("an object without a size") unless size.match?(/\A[0-9]{1,18}\z/)
+      key = encoded ? (S3.url_decode(raw) || raise(malformed.call("a key that is not URL-encoded UTF-8"))) : raw
+      modified = begin
+                   (m = f["LastModified"]?) ? Time.iso8601(m) : nil
+                 rescue ArgumentError
+                   nil
+                 end
+      ObjectSummary.new(key, size.to_i, f["ETag"]? || "", modified)
+    end
+    token = top["NextContinuationToken"]?
+    token = nil if token == ""
+    if top["IsTruncated"]? == "true" && token.nil?
+      raise malformed.call("a truncated page without a continuation token")
+    end
+    ListObjectsV2Output.new(objects, top["IsTruncated"]? == "true" ? token : nil)
+  end
+
+  # :nodoc:
+  # `text` URL-decoded as S3's `encoding-type=url` writes it (`+` a space,
+  # `%XX` a byte), or nil when an escape is malformed or the bytes are not
+  # UTF-8.
+  #
+  # ```
+  # AWS::S3.url_decode("a+b%2Bc/%C3%BC")   # => "a b+c/ü"
+  # ```
+  def self.url_decode(text: String) -> String?
+    b = Bytes::Builder.new
+    bytes = text.to_bytes
+    i = 0
+    while i < bytes.size
+      c = bytes[i]
+      if c == 37
+        return nil unless i + 2 < bytes.size
+        hex = bytes.slice(i + 1, 2).decode? || ""
+        return nil unless hex.match?(/\A[0-9A-Fa-f]{2}\z/)
+        b << hex.to_i(16)
+        i += 3
+      else
+        b << (c == 43 ? 32 : c)
+        i += 1
+      end
+    end
+    b.to_bytes.decode?
+  end
+
   # :nodoc:
   # The unsigned GET or HEAD of `key` (its version when given), asking
   # for the checksum, its arguments checked.
@@ -337,7 +476,21 @@ class S3
   # A key of `/` is an object's (`//`, `/{bucket}//` in path style).
   def url_for(bucket: String, key: String) -> URI
     raise ArgumentError.new("key: empty (the URL would name the bucket, not an object)") if key.empty?
-    path = S3.key_path(key)
+    located(bucket, S3.key_path(key))
+  end
+
+  # :nodoc:
+  # The URL of `bucket` itself, for a bucket operation (a listing):
+  # `https://{bucket}.s3.{region}.amazonaws.com/`, or `/{bucket}` in path
+  # style.
+  def bucket_url(bucket: String) -> URI
+    u = located(bucket, "")
+    u.path.empty? ? u.with(path: "/") : u
+  end
+
+  # :nodoc:
+  # `path` (empty, or from `/`) in `bucket`, addressed as the class says.
+  def located(bucket: String, path: String) -> URI
     if o = @override
       base = o.path.end_with?("/") ? o.path[0, o.path.size - 1] : o.path
       return o.with(path: "#{base}/#{bucket}#{path}", query: nil)

@@ -26,12 +26,43 @@ module XML
   # "Credentials"]`), by that name; the first one wins. Raises
   # [Refused] on what it does not read.
   def self.fields(xml: String, names: Array[String], within: Array[String] = []) -> Hash[String, String]
+    out = Hash::Builder[String, String].new
+    XML.walk(xml) do |stack, name, text|
+      out[name] = text if names.include?(name) && !out.key?(name) && XML.under?(stack, within)
+    end
+    out.to_h
+  end
+
+  # The elements named `element` (a local name) whose parents end with
+  # `within`, in order: for each, the text of its children whose local
+  # name is in `names`, by that name (the first one wins). S3's listing:
+  # `XML.each_element(xml, "Contents", ["Key", "Size"], ["ListBucketResult"])`.
+  # Raises [Refused] on what it does not read.
+  def self.each_element(xml: String, element: String, names: Array[String], within: Array[String] = []) -> Array[Hash[String, String]]
+    found: Array[Hash[String, String]] = []
+    current = Hash::Builder[String, String].new
+    inside = within + [element]
+    XML.walk(xml) do |stack, name, text|
+      if name == element && XML.under?(stack, within)
+        found = found.push(current.to_h)
+        current = Hash::Builder[String, String].new
+      elsif names.include?(name) && !current.key?(name) && XML.under?(stack, inside)
+        current[name] = text
+      end
+    end
+    found
+  end
+
+  # :nodoc:
+  # Walks `xml`, calling the block at the end of each element with its
+  # parents' qualified names, its local name and its text (stripped; ""
+  # for an empty element). Raises [Refused] on what it does not read.
+  def self.walk(xml: String, &: (Array[String], String, String) -> Void) -> Void
     # (Walked once, by bytes: the syntax looked for is ASCII, which never
     # occurs inside a UTF-8 sequence, so a cut there is a character
     # boundary. Indexing the String by character costs the position, and
     # made the walk quadratic in the answer's length: aws#24.)
     b = xml.to_bytes
-    out = Hash::Builder[String, String].new
     stack: Array[String] = []
     text = String::Builder.new
     rooted = false
@@ -54,10 +85,7 @@ module XML
           qname = tag[1, tag.size - 1].strip
           XML.refuse("an unbalanced </#{qname}>") if stack.empty? || stack.last != qname
           stack = stack.take(stack.size - 1)
-          name = XML.local(qname)
-          if names.include?(name) && !out.key?(name) && XML.under?(stack, within)
-            out[name] = text.to_s.strip
-          end
+          yield stack, XML.local(qname), text.to_s.strip
           text = String::Builder.new
         else
           empty = tag.end_with?("/")
@@ -67,8 +95,7 @@ module XML
           XML.refuse("a second root element") if stack.empty? && rooted
           rooted = true
           if empty
-            name = XML.local(qname)
-            out[name] = "" if names.include?(name) && !out.key?(name) && XML.under?(stack, within)
+            yield stack, XML.local(qname), ""
           else
             stack = stack.push(qname)
             XML.refuse("elements nested deeper than #{MAX_DEPTH}") if stack.size > MAX_DEPTH
@@ -93,7 +120,7 @@ module XML
     end
     XML.refuse("no root element") unless rooted
     XML.refuse("unclosed elements") unless stack.empty?
-    out.to_h
+    nil
   end
 
   # :nodoc:
