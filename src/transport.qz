@@ -15,9 +15,10 @@ require "http"
 # - a [TransportError] of the connection: it failed, broke, or gave no
 #   answer within `timeout`.
 #
-# Not tried again: any other error answer, and the [TransportError] of
-# an answer larger than the read bound (the same request would get the
-# same answer).
+# Not tried again: any other error answer, the [TransportError] of an
+# answer larger than the read bound (the same request would get the
+# same answer), and the caller's `too_large` for a 2xx answer past its
+# own bound.
 #
 # An error answer whose code is one of the service's skew codes, when the
 # answer's Date header is over 4 minutes from our clock as corrected so
@@ -61,15 +62,19 @@ class Transport
   # tried again as the class says. A 2xx answer is returned; another is
   # raised as `error` makes it of the status, headers and body text.
   # `what` names the call in errors ("KMS Encrypt"); `read_limit` bounds
-  # the body read (more is a [TransportError]).
+  # the body read (more is a [TransportError]). A 2xx answer is read
+  # within `success_limit` instead when given (an object's body), and one
+  # past it, by its Content-Length before any of it is read or while
+  # reading, raises `too_large`.
   def send(request: HTTP::Client::Request, what: String, read_limit: Int,
-           error: (Int, HTTP::Headers, String) -> ServiceError) -> Answer
+           error: (Int, HTTP::Headers, String) -> ServiceError, *, success_limit: Int? = nil,
+           too_large: Exception? = nil) -> Answer
     attempt = 0
     skewed = false
     loop do
       used = @skew.get
       answer = begin
-                 once(request, what, read_limit, used)
+                 once(request, what, read_limit, used, success_limit, too_large)
                rescue HTTP::Client::ResponseTooLarge
                  # (Not tried again: the same request would get the same
                  # answer.)
@@ -109,14 +114,30 @@ class Transport
   end
 
   # One attempt: `request` signed with the skew `skew`, sent, its answer
-  # read within `read_limit` bytes, under the timeout.
-  private def once(request: HTTP::Client::Request, what: String, read_limit: Int, skew: Int) -> Answer
+  # read within `read_limit` bytes (a 2xx within `success_limit`, else
+  # `too_large`), under the timeout.
+  private def once(request: HTTP::Client::Request, what: String, read_limit: Int, skew: Int,
+                   success_limit: Int?, too_large: Exception?) -> Answer
     keys = @config.credentials.get
     signed = SigV4.sign(request, service: @service, region: @config.region, credentials: keys, time: Time.now + skew.milliseconds)
     begin
       Task.timeout(@config.timeout) do
         res = @config.http.request(signed)
-        Answer.new(res.status, res.headers, res.body.read_bytes(max: read_limit))
+        ok = res.status >= 200 && res.status <= 299
+        if ok && (limit = success_limit)
+          big = too_large || TransportError.new("#{what}: answered more than #{limit} bytes")
+          if (n = res.headers["content-length"]) && n.match?(/\A[0-9]{1,18}\z/) && n.to_i > limit
+            raise big
+          end
+          body = begin
+                   res.body.read_bytes(max: limit)
+                 rescue HTTP::Client::ResponseTooLarge
+                   raise big
+                 end
+          Answer.new(res.status, res.headers, body)
+        else
+          Answer.new(res.status, res.headers, res.body.read_bytes(max: read_limit))
+        end
       end
     rescue HTTP::Client::ResponseTooLarge => tl
       # (Left to `send`, which does not try it again.)

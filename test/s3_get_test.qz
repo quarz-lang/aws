@@ -1,0 +1,212 @@
+require "test"
+
+# A stand-in for S3's GET and HEAD of objects (path style, at the
+# config's endpoint): it records what it saw, checks a SigV4
+# Authorization for `s3`, and answers the object of the path from
+# `objects` (its body and headers), or as `script` says (each entry
+# once).
+data GetSeen = (method: String, target: String, headers: HTTP::Headers)
+
+# An object the stand-in serves: its body and the headers it answers with.
+data StoredObject = (body: Bytes, headers: Array[Array[String]])
+
+data FakeS3Get(seen: Atom[Array[GetSeen]], objects: Atom[Hash[String, StoredObject]], script: Atom[Array[String]])
+  def self.make -> FakeS3Get
+    FakeS3Get.new(Atom[Array[GetSeen]].new([]), Atom[Hash[String, StoredObject]].new(Hash[String, StoredObject].new), Atom[Array[String]].new([]))
+  end
+
+  def handler -> HTTP::Handler
+    me = self
+    HTTP.handler { |req| me.answer(req) }
+  end
+
+  def answer(req: HTTP::Server::Request) -> HTTP::Server::Response
+    seen.update { |s| s + [GetSeen.new(req.method, req.target, req.headers)] }
+    auth = req.headers["authorization"] || ""
+    unless auth.match?(/\AAWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/\d{8}\/us-east-1\/s3\/aws4_request, SignedHeaders=[a-z0-9;-]+, Signature=[0-9a-f]{64}\z/)
+      return HTTP::Server::Response.text("<Error><Code>SignatureDoesNotMatch</Code></Error>", 403)
+    end
+    queued = script.get
+    unless queued.empty?
+      script.set(queued.drop(1))
+      case queued[0]
+      in "forbidden-head" then return HTTP::Server::Response.text("", 403).header("x-amz-request-id", "req-403")
+      in "region-head" then return HTTP::Server::Response.text("", 400).header("x-amz-bucket-region", "eu-west-1")
+      in "denied"
+        return HTTP::Server::Response.text("<Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>req-ad</RequestId></Error>", 403)
+      else nil
+      end
+    end
+    path = req.target.partition("?")[0]
+    obj = objects.get[path]?
+    if obj.nil?
+      return HTTP::Server::Response.text("", 404) if req.method == "HEAD"
+      return HTTP::Server::Response.text("<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><RequestId>req-404</RequestId></Error>", 404)
+    end
+    o = obj.as(StoredObject)
+    res = HTTP::Server::Response.bytes(o.body, "application/octet-stream")
+    o.headers.each { |h| res = res.header(h[0], h[1]) }
+    res
+  end
+
+  def put(path: String, body: Bytes, headers: Array[Array[String]] = []) -> Void
+    objects.update { |m| m.put(path, StoredObject.new(body, headers)) }
+    nil
+  end
+end
+
+module S3GetFakes
+  # A client of a stand-in while the block runs.
+  def self.with(fake: FakeS3Get, &: (AWS::S3) -> Void) -> Void
+    server = HTTP::Server.new(fake.handler, host: "127.0.0.1", port: 0)
+    Task.scope do |scope|
+      scope.spawn { server.serve }
+      begin
+        creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+        config = AWS::Config.new(region: "us-east-1", credentials: creds, endpoint: URI.parse("http://127.0.0.1:#{server.local_address.port}"),
+                                 http: HTTP::Client.new(proxy: nil), retries: 2, timeout: 5.seconds,
+                                 retry_base: 1.milliseconds, retry_cap: 4.milliseconds)
+        yield AWS::S3.new(config)
+      ensure
+        server.shutdown
+      end
+    end
+    nil
+  end
+end
+
+class S3GetTest < Test::Case
+  BODY = b"{\"day\":\"2026-11-26\",\"rows\":42}"
+
+  def sha(body: Bytes) -> String = Base64.encode(Digest::SHA256.digest(body))
+
+  def full_headers(body: Bytes) -> Array[Array[String]]
+    [["Content-Type", "application/json"], ["ETag", "\"e-1\""], ["x-amz-version-id", "v-7"],
+     ["Last-Modified", "Thu, 26 Nov 2026 01:02:03 GMT"], ["x-amz-meta-Source", "daily"], ["x-amz-meta-rows", "42"],
+     ["x-amz-object-lock-mode", "COMPLIANCE"], ["x-amz-object-lock-retain-until-date", "2027-01-01T00:00:00.000Z"],
+     ["x-amz-object-lock-legal-hold", "ON"], ["x-amz-checksum-sha256", sha(body)], ["x-amz-checksum-type", "FULL_OBJECT"]]
+  end
+
+  def client -> AWS::S3
+    AWS::S3.new(AWS::Config.new(region: "eu-west-1", credentials: AWS::Credentials.static(access_key_id: "AKIDEXAMPLE",
+                                                                                          secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")))
+  end
+
+  # The request: method, URL (version id in the query, encoded once),
+  # the checksum mode and the owner; and its signature over the query.
+  def test_read_requests
+    c = client
+    r = c.read_request("GET", bucket: "exports", key: "a b/c.json", version_id: "3/L4kqtJl+cB=", expected_bucket_owner: "123456789012")
+    assert_equal("https://exports.s3.eu-west-1.amazonaws.com/a%20b/c.json?versionId=3%2FL4kqtJl%2BcB%3D", r.url.to_s)
+    assert_equal(["GET", "ENABLED", "123456789012"], [r.method, r.headers["x-amz-checksum-mode"] || "", r.headers["x-amz-expected-bucket-owner"] || ""])
+    assert_equal("HEAD", c.read_request("HEAD", bucket: "exports", key: "k").method)
+    keys = AWS::Credentials::Keys.new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+    signed = AWS::SigV4.sign(r, service: "s3", region: "eu-west-1", credentials: keys, time: Time.utc(2026, 11, 26))
+    parts = AWS::SigV4.parts("GET", r.url, signed.headers.delete("authorization"), signed.headers["x-amz-content-sha256"] || "",
+                             service: "s3", region: "eu-west-1", credentials: keys, time: Time.utc(2026, 11, 26))
+    assert_equal("GET\n/a%20b/c.json\nversionId=3%2FL4kqtJl%2BcB%3D", parts.canonical_request.split("\n").first(3).join("\n"))
+    # The empty payload's hash: a GET has no body.
+    assert_equal("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", signed.headers["x-amz-content-sha256"])
+    ["", "Bad"].each do |b|
+      assert_raise(ArgumentError) { c.read_request("GET", bucket: "x#{b}", key: "k") }
+    end
+    assert_raise(ArgumentError) { c.read_request("GET", bucket: "exports", key: "") }
+    assert_raise(ArgumentError) { c.read_request("GET", bucket: "exports", key: "k", version_id: "") }
+    assert_raise(ArgumentError) { c.read_request("GET", bucket: "exports", key: "k", expected_bucket_owner: "1") }
+    assert_raise(ArgumentError) { c.get_object(bucket: "exports", key: "k", max_bytes: -1) }
+  end
+
+  def test_get_object_and_head_object
+    fake = FakeS3Get.make
+    fake.put("/exports/daily/2026-11-26.json", BODY, full_headers(BODY))
+    S3GetFakes.with(fake) do |s3|
+      out = s3.get_object(bucket: "exports", key: "daily/2026-11-26.json", max_bytes: 1_000, version_id: "v-7",
+                          expected_bucket_owner: "123456789012")
+      assert_equal(BODY, out.body)
+      assert_equal(["application/json", "\"e-1\"", "v-7"], [out.content_type || "", out.etag, out.version_id || ""])
+      assert_equal(Time.utc(2026, 11, 26, 1, 2, 3), out.last_modified)
+      assert_equal({"source" => "daily", "rows" => "42"}, out.metadata)
+      assert_equal(:compliance, out.object_lock_mode)
+      assert_equal(Time.utc(2027, 1, 1), out.object_lock_retain_until_date)
+      assert_equal(true, out.object_lock_legal_hold)
+      assert_equal(AWS::S3::Checksum.new(:sha256, sha(BODY)), out.checksum)
+      assert_true(out.checksum_verified)
+      refute(out.inspect.include?("rows"), out.inspect)
+      seen = fake.seen.get[0]
+      assert_equal(["GET", "/exports/daily/2026-11-26.json?versionId=v-7", "ENABLED", "123456789012"],
+                   [seen.method, seen.target, seen.headers["x-amz-checksum-mode"] || "", seen.headers["x-amz-expected-bucket-owner"] || ""])
+      head = s3.head_object(bucket: "exports", key: "daily/2026-11-26.json")
+      assert_equal(BODY.size, head.content_length)
+      assert_equal(["application/json", "\"e-1\"", "v-7"], [head.content_type || "", head.etag, head.version_id || ""])
+      assert_equal({"source" => "daily", "rows" => "42"}, head.metadata)
+      assert_equal([:compliance.inspect, Time.utc(2027, 1, 1).inspect, "true"],
+                   [head.object_lock_mode.inspect, head.object_lock_retain_until_date.inspect, head.object_lock_legal_hold.inspect])
+      assert_equal(AWS::S3::Checksum.new(:sha256, sha(BODY)), head.checksum)
+      assert_equal("HEAD", fake.seen.get[1].method)
+    end
+  end
+
+  # The bound: exactly `max_bytes` is read; one byte more is
+  # ObjectTooLarge, sent once.
+  def test_max_bytes
+    fake = FakeS3Get.make
+    fake.put("/b-1/k", BODY, [["x-amz-checksum-sha256", sha(BODY)]])
+    S3GetFakes.with(fake) do |s3|
+      assert_equal(BODY, s3.get_object(bucket: "b-1", key: "k", max_bytes: BODY.size).body)
+      before = fake.seen.get.size
+      e = assert_raise(AWS::S3::ObjectTooLarge) { s3.get_object(bucket: "b-1", key: "k", max_bytes: BODY.size - 1) }
+      assert_equal("S3 GetObject: the object is larger than max_bytes (#{BODY.size - 1})", e.message)
+      assert_equal(before + 1, fake.seen.get.size)
+      # An error document is read with its own bound, whatever max_bytes.
+      e2 = assert_raise(AWS::ServiceError) { s3.get_object(bucket: "b-1", key: "missing", max_bytes: 1) }.as(AWS::ServiceError)
+      assert_equal(["NoSuchKey", 404, "req-404"], [e2.code, e2.status, e2.request_id || ""])
+    end
+  end
+
+  # A checksum that does not match raises; one of another algorithm or a
+  # multipart one is left unchecked, never a mismatch.
+  def test_checksums
+    fake = FakeS3Get.make
+    fake.put("/b-1/bad", BODY, [["x-amz-checksum-sha256", sha(b"something else")]])
+    fake.put("/b-1/parts", BODY, [["x-amz-checksum-sha256", "ZGVhZGJlZWZkZWFkYmVlZmRlYWRiZWVmZGVhZGJlZWY=-3"], ["x-amz-checksum-type", "COMPOSITE"]])
+    fake.put("/b-1/parts2", BODY, [["x-amz-checksum-sha256", "ZGVhZGJlZWZkZWFkYmVlZmRlYWRiZWVmZGVhZGJlZWY=-3"]])
+    fake.put("/b-1/crc", BODY, [["x-amz-checksum-crc64nvme", "AAAAAAAAAAA="]])
+    fake.put("/b-1/none", BODY)
+    S3GetFakes.with(fake) do |s3|
+      before = fake.seen.get.size
+      e = assert_raise(AWS::S3::ChecksumMismatch) { s3.get_object(bucket: "b-1", key: "bad", max_bytes: 1_000) }
+      assert_equal("S3 GetObject: the body does not match the SHA-256 checksum S3 gave", e.message)
+      assert_equal(before + 1, fake.seen.get.size)
+      ["parts", "parts2"].each do |k|
+        out = s3.get_object(bucket: "b-1", key: k, max_bytes: 1_000)
+        assert_false(out.checksum_verified)
+        assert_equal(:sha256, out.checksum.as(AWS::S3::Checksum).algorithm)
+      end
+      crc = s3.get_object(bucket: "b-1", key: "crc", max_bytes: 1_000)
+      assert_equal([":crc64nvme", "false"], [crc.checksum.as(AWS::S3::Checksum).algorithm.inspect, crc.checksum_verified.inspect])
+      none = s3.get_object(bucket: "b-1", key: "none", max_bytes: 1_000)
+      assert_nil(none.checksum)
+      assert_false(none.checksum_verified)
+    end
+  end
+
+  # HEAD's errors come from the status: 404 NotFound, 403 Forbidden (a
+  # missing key the caller may not list), a 400 with the bucket's region
+  # WrongRegion; GET's from S3's document.
+  def test_errors
+    fake = FakeS3Get.make
+    S3GetFakes.with(fake) do |s3|
+      e = assert_raise(AWS::ServiceError) { s3.head_object(bucket: "b-1", key: "missing") }.as(AWS::ServiceError)
+      assert_equal(["NotFound", 404], [e.code, e.status])
+      fake.script.set(["forbidden-head"])
+      e = assert_raise(AWS::ServiceError) { s3.head_object(bucket: "b-1", key: "missing") }.as(AWS::ServiceError)
+      assert_equal(["Forbidden", 403, "req-403"], [e.code, e.status, e.request_id || ""])
+      fake.script.set(["region-head"])
+      w = assert_raise(AWS::S3::WrongRegion) { s3.head_object(bucket: "b-1", key: "k") }.as(AWS::S3::WrongRegion)
+      assert_equal(["AuthorizationHeaderMalformed", 400, "eu-west-1"], [w.code, w.status, w.region || ""])
+      fake.script.set(["denied"])
+      e = assert_raise(AWS::ServiceError) { s3.get_object(bucket: "b-1", key: "k", max_bytes: 10) }.as(AWS::ServiceError)
+      assert_equal(["AccessDenied", 403], [e.code, e.status])
+    end
+  end
+end
