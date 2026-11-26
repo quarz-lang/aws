@@ -328,6 +328,7 @@ class S3
   # `next_continuation_token` is not nil:
   #
   # ```quarz no_run
+  # s3 = AWS::S3.new(AWS::Config.new(region: "eu-west-1", credentials: AWS::Credentials.default))
   # token: String? = nil
   # loop do
   #   page = s3.list_objects_v2(bucket: "exports-123456789012", prefix: "daily/", continuation_token: token)
