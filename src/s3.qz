@@ -399,6 +399,10 @@ class S3
     rescue XML::Refused => e
       raise malformed.call("XML this client does not take: #{e.message}")
     end
+    # (The XML reader strips an element's text: a key with leading or
+    # trailing blanks keeps them only encoded, as with `encoding-type=url`,
+    # always asked for. An answer without it, from a store that ignores
+    # the parameter, would lose them.)
     encoded = top["EncodingType"]? == "url"
     objects = entries.map do |f|
       raw = f["Key"]? || raise(malformed.call("an object without a key"))
