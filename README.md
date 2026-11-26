@@ -222,6 +222,14 @@ out.etag; out.version_id; out.checksum   # an AWS::S3::Checksum(:sha256, base64)
 got = s3.get_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json", max_bytes: 64 * 1024 * 1024)
 got.body; got.checksum_verified; got.object_lock_retain_until_date
 s3.head_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json").content_length
+
+token: String? = nil
+loop do
+  page = s3.list_objects_v2(bucket: "exports-123456789012", prefix: "daily/", continuation_token: token)
+  page.objects.each { |o| puts "#{o.key} #{o.size}" }
+  token = page.next_continuation_token
+  break if token.nil?
+end
 ```
 
 - `put_object(bucket:, key:, body:, ...)` writes one object in one PUT
@@ -268,6 +276,14 @@ s3.head_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json").con
   `x-amz-bucket-region`. For a missing key, S3 answers 403 rather than
   404 (`AccessDenied` for GET) when the caller may not list the bucket;
   the error keeps the status.
+- `list_objects_v2(bucket:, prefix:, continuation_token:, max_keys:, expected_bucket_owner:)`
+  gives one page (one request) of the keys under `prefix`: each
+  object's key, size, ETag and last modification, and
+  `next_continuation_token` (nil on the last page), on which a caller
+  loops. The request asks for `encoding-type=url` and each key is
+  decoded, so that a key holding a character XML 1.0 cannot carry
+  comes back exactly. `max_keys` is 1 to 1000; the answer is read
+  within 4 MiB, enough for a full page of the longest keys.
 - Errors are S3's XML error documents as [AWS::ServiceError]s, matched
   on `code` (`AccessDenied`, `NoSuchBucket`, `InvalidRequest` for the
   Object Lock refusals, ...); a bucket in another region (301
@@ -293,7 +309,7 @@ s3.head_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json").con
 
 ### Not there yet
 
-S3's `list_objects_v2` (next), ranged reads, multipart
+S3's ranged reads, an iterator over all the pages of a listing, multipart
 uploads, bucket management, copy, delete and ACLs; other services
 (SQS, STS beyond the credentials); presigned S3 uploads beyond
 [AWS::SigV4.presign] itself; a data-key cache for [AWS::KMS::Envelope].

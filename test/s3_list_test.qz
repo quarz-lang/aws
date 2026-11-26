@@ -1,0 +1,178 @@
+require "test"
+
+# A stand-in for S3's ListObjectsV2 (path style, at the config's
+# endpoint): it records the targets it saw, checks a SigV4 Authorization
+# for `s3`, and answers the document `pages` holds for the request's
+# continuation token ("" for the first page), or as `script` says.
+data ListFake(targets: Atom[Array[String]], pages: Atom[Hash[String, String]], script: Atom[Array[String]])
+  def self.make -> ListFake
+    ListFake.new(Atom[Array[String]].new([]), Atom[Hash[String, String]].new(Hash[String, String].new), Atom[Array[String]].new([]))
+  end
+
+  def handler -> HTTP::Handler
+    me = self
+    HTTP.handler { |req| me.answer(req) }
+  end
+
+  def answer(req: HTTP::Server::Request) -> HTTP::Server::Response
+    targets.update { |t| t + [req.target] }
+    auth = req.headers["authorization"] || ""
+    unless auth.match?(/\AAWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/\d{8}\/us-east-1\/s3\/aws4_request, SignedHeaders=[a-z0-9;-]+, Signature=[0-9a-f]{64}\z/)
+      return HTTP::Server::Response.text("<Error><Code>SignatureDoesNotMatch</Code></Error>", 403)
+    end
+    queued = script.get
+    unless queued.empty?
+      script.set(queued.drop(1))
+      case queued[0]
+      in "nobucket"
+        return HTTP::Server::Response.text("<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><RequestId>req-nb</RequestId></Error>", 404)
+      in "huge" then return HTTP::Server::Response.text("<ListBucketResult>" + ("x" * (4 * 1024 * 1024)) + "</ListBucketResult>", 200)
+      in "bad" then return HTTP::Server::Response.text("<ListBucketResult><!DOCTYPE x></ListBucketResult>", 200)
+      else nil
+      end
+    end
+    token = ""
+    (req.target.partition("?")[2]).split("&").each do |pair|
+      k, _, v = pair.partition("=")
+      token = AWS::SigV4.decode_bytes(v).decode if k == "continuation-token"
+    end
+    HTTP::Server::Response.text(pages.get[token]? || "<ListBucketResult/>", 200).header("Content-Type", "application/xml")
+  end
+end
+
+class S3ListTest < Test::Case
+  DOC_KEYS = AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+  def with_fake(fake: ListFake, &: (AWS::S3) -> Void) -> Void
+    server = HTTP::Server.new(fake.handler, host: "127.0.0.1", port: 0)
+    Task.scope do |scope|
+      scope.spawn { server.serve }
+      begin
+        creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+        config = AWS::Config.new(region: "us-east-1", credentials: creds, endpoint: URI.parse("http://127.0.0.1:#{server.local_address.port}"),
+                                 http: HTTP::Client.new(proxy: nil), retries: 1, timeout: 5.seconds,
+                                 retry_base: 1.milliseconds, retry_cap: 4.milliseconds)
+        yield AWS::S3.new(config)
+      ensure
+        server.shutdown
+      end
+    end
+    nil
+  end
+
+  def page(contents: Array[String], *, next_token: String? = nil, encoded: Bool = true) -> String
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>exports</Name>" +
+      "<Prefix>daily/</Prefix><KeyCount>#{contents.size}</KeyCount><MaxKeys>1000</MaxKeys>" +
+      (encoded ? "<EncodingType>url</EncodingType>" : "") +
+      "<IsTruncated>#{next_token ? "true" : "false"}</IsTruncated>" +
+      (next_token ? "<NextContinuationToken>#{next_token}</NextContinuationToken>" : "") +
+      contents.join + "</ListBucketResult>"
+  end
+
+  def entry(key: String, size: Int) -> String
+    "<Contents><Key>#{key}</Key><LastModified>2026-11-26T01:02:03.000Z</LastModified><ETag>&quot;e-#{size}&quot;</ETag>" +
+      "<ChecksumAlgorithm>SHA256</ChecksumAlgorithm><Size>#{size}</Size><StorageClass>STANDARD</StorageClass>" +
+      "<Owner><ID>owner-id</ID><DisplayName>Key</DisplayName></Owner></Contents>"
+  end
+
+  # The query (prefix and token encoded once) and the signature over it:
+  # the values were computed by an independent SigV4 implementation of
+  # the specification (Python's hashlib, hmac and urllib.parse), not by
+  # this cog.
+  def test_list_request_and_its_signature
+    s3 = AWS::S3.new(AWS::Config.new(region: "us-east-1", credentials: AWS::Credentials.static(access_key_id: DOC_KEYS.access_key_id,
+                                                                                              secret_access_key: DOC_KEYS.secret_access_key)))
+    req = s3.list_request(bucket: "exports", prefix: "daily/2026 ü+", continuation_token: "1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=",
+                          max_keys: 2, expected_bucket_owner: "111122223333")
+    assert_equal("https://exports.s3.us-east-1.amazonaws.com/?list-type=2&encoding-type=url&prefix=daily%2F2026%20%C3%BC%2B" +
+                 "&continuation-token=1ueGcxLPRx1Tr%2FXYExHnhbYLgveDs2J%2Fwm36Hy4vbOwM%3D&max-keys=2", req.url.to_s)
+    signed = AWS::SigV4.sign(req, service: "s3", region: "us-east-1", credentials: DOC_KEYS, time: Time.utc(2026, 11, 26))
+    parts = AWS::SigV4.parts("GET", req.url, signed.headers.delete("authorization"), signed.headers["x-amz-content-sha256"] || "",
+                             service: "s3", region: "us-east-1", credentials: DOC_KEYS, time: Time.utc(2026, 11, 26))
+    assert_equal("continuation-token=1ueGcxLPRx1Tr%2FXYExHnhbYLgveDs2J%2Fwm36Hy4vbOwM%3D&encoding-type=url&list-type=2&max-keys=2" +
+                 "&prefix=daily%2F2026%20%C3%BC%2B", parts.canonical_request.split("\n")[2])
+    assert_equal("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261126/us-east-1/s3/aws4_request, " +
+                 "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-expected-bucket-owner, " +
+                 "Signature=54f47e8f982658c51ce3a9a2cc3e50abf4fe127b0a38aaefe9b38d20d3e7abc0", signed.headers["authorization"])
+    # Path style for a dotted bucket; no prefix.
+    dotted = s3.list_request(bucket: "my.exports")
+    assert_equal("https://s3.us-east-1.amazonaws.com/my.exports?list-type=2&encoding-type=url", dotted.url.to_s)
+    [0, 1001].each { |m| assert_raise(ArgumentError) { s3.list_request(bucket: "exports", max_keys: m) } }
+    assert_raise(ArgumentError) { s3.list_request(bucket: "Exports") }
+    assert_raise(ArgumentError) { s3.list_request(bucket: "exports", continuation_token: "") }
+    assert_raise(ArgumentError) { s3.list_request(bucket: "exports", expected_bucket_owner: "12") }
+  end
+
+  # Two pages, the second asked for with the first's token; keys decoded
+  # from `encoding-type=url` (spaces, slashes, `+`, `%`, non-ASCII, and
+  # characters XML 1.0 cannot carry).
+  def test_pages_and_awkward_keys
+    fake = ListFake.make
+    first = page([entry("daily/a+b%2Bc.json", 10), entry("daily/%C3%BC/%E6%97%A5%E6%9C%AC", 20), entry("daily/ctl%01%0C%1Bx", 30)],
+                 next_token: "tok/en+1=")
+    second = page([entry("daily/last%25%26%3C.json", 40)])
+    fake.pages.update { |p| p.put("", first).put("tok/en+1=", second) }
+    with_fake(fake) do |s3|
+      one = s3.list_objects_v2(bucket: "exports", prefix: "daily/", max_keys: 3)
+      assert_equal(["daily/a b+c.json", "daily/ü/日本", "daily/ctl\u0001\u000c\u001bx"], one.objects.map(&:key))
+      assert_equal([10, 20, 30], one.objects.map(&:size))
+      assert_equal("\"e-10\"", one.objects[0].etag)
+      assert_equal(Time.utc(2026, 11, 26, 1, 2, 3), one.objects[0].last_modified)
+      assert_equal("tok/en+1=", one.next_continuation_token)
+      two = s3.list_objects_v2(bucket: "exports", prefix: "daily/", continuation_token: one.next_continuation_token)
+      assert_equal(["daily/last%&<.json"], two.objects.map(&:key))
+      assert_nil(two.next_continuation_token)
+      assert_equal(["/exports?list-type=2&encoding-type=url&prefix=daily%2F&max-keys=3",
+                    "/exports?list-type=2&encoding-type=url&prefix=daily%2F&continuation-token=tok%2Fen%2B1%3D"], fake.targets.get)
+    end
+  end
+
+  def test_empty_and_unencoded_answers
+    fake = ListFake.make
+    fake.pages.update { |p| p.put("", page(Array[String].new)) }
+    with_fake(fake) do |s3|
+      out = s3.list_objects_v2(bucket: "exports")
+      assert_equal([0, "nil"], [out.objects.size, out.next_continuation_token.inspect])
+    end
+    # A store that ignores encoding-type: keys taken as they are.
+    plain = ListFake.make
+    plain.pages.update { |p| p.put("", page([entry("a+b%2B", 1)], encoded: false)) }
+    with_fake(plain) do |s3|
+      assert_equal(["a+b%2B"], s3.list_objects_v2(bucket: "exports").objects.map(&:key))
+    end
+  end
+
+  def test_errors
+    fake = ListFake.make
+    with_fake(fake) do |s3|
+      fake.script.set(["nobucket"])
+      e = assert_raise(AWS::ServiceError) { s3.list_objects_v2(bucket: "exports") }.as(AWS::ServiceError)
+      assert_equal(["NoSuchBucket", 404, "req-nb"], [e.code, e.status, e.request_id || ""])
+      fake.script.set(["bad"])
+      e = assert_raise(AWS::ServiceError) { s3.list_objects_v2(bucket: "exports") }.as(AWS::ServiceError)
+      assert_equal("MalformedAnswer", e.code)
+      # Past LIST_LIMIT: a TransportError, sent once.
+      fake.script.set(["huge"])
+      before = fake.targets.get.size
+      t = assert_raise(AWS::TransportError) { s3.list_objects_v2(bucket: "exports") }
+      assert_equal("S3 ListObjectsV2: answered more than #{AWS::S3::LIST_LIMIT} bytes", t.message)
+      assert_equal(before + 1, fake.targets.get.size)
+    end
+    # Malformed pages.
+    [page(["<Contents><Size>1</Size></Contents>"]), page([entry("%zz", 1)]), page([entry("%FF", 1)]),
+     page(["<Contents><Key>k</Key><Size>x</Size></Contents>"]),
+     "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>"].each do |doc|
+      e = assert_raise(AWS::ServiceError) { AWS::S3.listing(doc) }.as(AWS::ServiceError)
+      assert_equal("MalformedAnswer", e.code)
+      refute(e.message.include?("%zz"))
+    end
+  end
+
+  def test_url_decode
+    assert_equal("a b+c/ü", AWS::S3.url_decode("a+b%2Bc/%C3%BC"))
+    assert_nil(AWS::S3.url_decode("%"))
+    assert_nil(AWS::S3.url_decode("%4"))
+    assert_nil(AWS::S3.url_decode("%G0"))
+    assert_nil(AWS::S3.url_decode("%C3"))
+  end
+end
