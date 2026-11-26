@@ -1,0 +1,267 @@
+require "test"
+
+# A stand-in for S3 (path style, at the config's endpoint): it records
+# each request and checks what S3 would (the payload's SHA-256 against
+# `x-amz-content-sha256`, the checksum header against the body, a SigV4
+# Authorization for `s3`), then answers as `script` says (each entry
+# once, then "ok"). The signature's exact value is pinned by the tests
+# of `put_request`, against independently computed values, not here.
+# What the stand-in saw of a request.
+data Seen = (method: String, target: String, headers: HTTP::Headers)
+
+data FakeS3(seen: Atom[Array[Seen]], bodies: Atom[Array[Bytes]], script: Atom[Array[String]])
+  def self.make -> FakeS3 = FakeS3.new(Atom[Array[Seen]].new([]), Atom[Array[Bytes]].new([]), Atom[Array[String]].new([]))
+
+  def handler -> HTTP::Handler
+    me = self
+    HTTP.handler { |req| me.answer(req) }
+  end
+
+  def answer(req: HTTP::Server::Request) -> HTTP::Server::Response
+    body = req.body.read_bytes
+    got = Seen.new(req.method, req.target, req.headers)
+    seen.update { |s| s + [got] }
+    bodies.update { |b| b + [body] }
+    auth = req.headers["authorization"] || ""
+    unless auth.match?(/\AAWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/\d{8}\/us-east-1\/s3\/aws4_request, SignedHeaders=[a-z0-9;-]+, Signature=[0-9a-f]{64}\z/)
+      return FakeS3.error(403, "SignatureDoesNotMatch", "bad authorization")
+    end
+    return FakeS3.error(400, "XAmzContentSHA256Mismatch", "payload hash") unless req.headers["x-amz-content-sha256"] == Digest::SHA256.hexdigest(body)
+    if (c = req.headers["x-amz-checksum-sha256"]) && c != Base64.encode(Digest::SHA256.digest(body))
+      return FakeS3.error(400, "BadDigest", "checksum")
+    end
+    if (m = req.headers["content-md5"]) && m != Base64.encode(Digest::MD5.digest(body))
+      return FakeS3.error(400, "BadDigest", "md5")
+    end
+    queued = script.get
+    step = queued.empty? ? "ok" : queued[0]
+    script.set(queued.drop(1)) unless queued.empty?
+    case step
+    in "slowdown" then FakeS3.error(503, "SlowDown", "Please reduce your request rate.")
+    in "denied" then FakeS3.error(403, "AccessDenied", "Access Denied")
+    in "nobucket" then FakeS3.error(404, "NoSuchBucket", "The specified bucket does not exist")
+    in "locked" then FakeS3.error(400, "InvalidRequest", "Object Lock retention must be later than the bucket's default")
+    in "skew"
+      ahead = (Time.now + 1.hour).utc.strftime("%a, %d %b %Y %H:%M:%S GMT")
+      FakeS3.error(403, "RequestTimeTooSkewed", "The difference between the request time and the current time is too large.").header("Date", ahead)
+    in "redirect" then HTTP::Server::Response.text("", 301).header("x-amz-bucket-region", "eu-west-1").header("x-amz-request-id", "req-301")
+    in "authmal"
+      HTTP::Server::Response.text("<Error><Code>AuthorizationHeaderMalformed</Code><Message>the region 'us-east-1' is wrong; expecting 'ap-northeast-1'</Message><Region>ap-northeast-1</Region><RequestId>req-400</RequestId></Error>", 400)
+    in "big" then HTTP::Server::Response.text("<Error><Code>X</Code><Message>#{"y" * 70_000}</Message></Error>", 500)
+    else
+      res = HTTP::Server::Response.text("", 200).header("ETag", "\"etag-1\"").header("x-amz-version-id", "v-1")
+      if c = req.headers["x-amz-checksum-sha256"]
+        res = res.header("x-amz-checksum-sha256", c)
+      end
+      res
+    end
+  end
+
+  def self.error(status: Int, code: String, message: String) -> HTTP::Server::Response
+    HTTP::Server::Response.text("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>#{code}</Code><Message>#{message}</Message><RequestId>req-err</RequestId><HostId>host</HostId></Error>", status)
+                          .header("Content-Type", "application/xml")
+  end
+end
+
+module S3Fakes
+  # A client of a stand-in S3 while the block runs.
+  def self.with(fake: FakeS3, retries: Int = 3, &: (AWS::S3) -> Void) -> Void
+    server = HTTP::Server.new(fake.handler, host: "127.0.0.1", port: 0)
+    Task.scope do |scope|
+      scope.spawn { server.serve }
+      begin
+        creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+        config = AWS::Config.new(region: "us-east-1", credentials: creds, endpoint: URI.parse("http://127.0.0.1:#{server.local_address.port}"),
+                                 http: HTTP::Client.new(proxy: nil), retries: retries, timeout: 5.seconds,
+                                 retry_base: 1.milliseconds, retry_cap: 4.milliseconds)
+        yield AWS::S3.new(config)
+      ensure
+        server.shutdown
+      end
+    end
+    nil
+  end
+end
+
+class S3Test < Test::Case
+  # The example keys of the AWS documentation's S3 examples.
+  DOC_KEYS = AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+  def client(region: String = "us-east-1") -> AWS::S3
+    AWS::S3.new(AWS::Config.new(region: region, credentials: AWS::Credentials.static(access_key_id: "AKIAIOSFODNN7EXAMPLE",
+                                                                                      secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")))
+  end
+
+  # The S3 documentation's "PUT Object" example (a body, a header the
+  # example signs): its published payload hash and signature.
+  def test_published_put_object_example
+    req = HTTP::Client::Request.put("https://examplebucket.s3.amazonaws.com/test$file.text", body: "Welcome to Amazon S3.")
+                               .header("Date", "Fri, 24 May 2013 00:00:00 GMT").header("x-amz-storage-class", "REDUCED_REDUNDANCY")
+    signed = AWS::SigV4.sign(req, service: "s3", region: "us-east-1", credentials: DOC_KEYS, time: Time.utc(2013, 5, 24))
+    assert_equal("44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072", signed.headers["x-amz-content-sha256"])
+    assert_equal("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, " +
+                 "SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, " +
+                 "Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd", signed.headers["authorization"])
+  end
+
+  # A PUT with a body, Object Lock, SSE-KMS, the expected owner and
+  # metadata, signed at a fixed time: the values were computed with an
+  # independent SigV4 implementation of the specification (Python's
+  # hashlib and hmac), not by this cog.
+  def test_put_request_and_its_signature
+    req = client.put_request(bucket: "examplebucket", key: "exports/2026-11-26/data ü.json", body: "hello object lock",
+                             content_type: "application/json", object_lock_mode: :compliance,
+                             object_lock_retain_until_date: Time.utc(2027, 1, 1), object_lock_legal_hold: true,
+                             server_side_encryption: :aws_kms, ssekms_key_id: "arn:aws:kms:us-east-1:111122223333:key/abcd",
+                             expected_bucket_owner: "111122223333", metadata: {"source" => "export"})
+    assert_equal("https://examplebucket.s3.us-east-1.amazonaws.com/exports/2026-11-26/data%20%C3%BC.json", req.url.to_s)
+    assert_equal("DgBdzdgmHMngjr+8SVTTfL/tisFFaxVEi8xv0eZWvz8=", req.headers["x-amz-checksum-sha256"])
+    assert_equal("SHA256", req.headers["x-amz-sdk-checksum-algorithm"])
+    assert_equal(["COMPLIANCE", "2027-01-01T00:00:00.000Z", "ON"],
+                 [req.headers["x-amz-object-lock-mode"], req.headers["x-amz-object-lock-retain-until-date"], req.headers["x-amz-object-lock-legal-hold"]].map { |v| v || "" })
+    signed = AWS::SigV4.sign(req, service: "s3", region: "us-east-1", credentials: DOC_KEYS, time: Time.utc(2026, 11, 26))
+    assert_equal("0e005dcdd8261cc9e08ebfbc4954d37cbfed8ac1456b15448bcc6fd1e656bf3f", signed.headers["x-amz-content-sha256"])
+    parts = AWS::SigV4.parts("PUT", req.url, signed.headers.delete("authorization"), signed.headers["x-amz-content-sha256"] || "",
+                             service: "s3", region: "us-east-1", credentials: DOC_KEYS, time: Time.utc(2026, 11, 26))
+    assert_equal("8b7e8f892c4cf49854f973fabf0742d630a34456493db3e6b44f68aa35c52327", Digest::SHA256.hexdigest(parts.canonical_request))
+    assert_equal("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261126/us-east-1/s3/aws4_request, " +
+                 "SignedHeaders=content-type;host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date;x-amz-expected-bucket-owner;" +
+                 "x-amz-meta-source;x-amz-object-lock-legal-hold;x-amz-object-lock-mode;x-amz-object-lock-retain-until-date;" +
+                 "x-amz-sdk-checksum-algorithm;x-amz-server-side-encryption;x-amz-server-side-encryption-aws-kms-key-id, " +
+                 "Signature=7b8861f095fe5c6a5f62b5f36c580cdc964dccdf0f6a746f015bb48e267f3c5e", signed.headers["authorization"])
+    # Content-MD5 on request, and no SHA-256 checksum then.
+    md5 = client.put_request(bucket: "examplebucket", key: "k", body: "hello", checksum: :md5)
+    assert_equal("XUFAKrxLKna5cZ2REBfFkg==", md5.headers["content-md5"])
+    assert_nil(md5.headers["x-amz-checksum-sha256"])
+  end
+
+  # Keys: each segment encoded once; nothing normalizes `.`, `..`, empty
+  # segments or a leading `/`; both addressing styles.
+  def test_urls_and_awkward_keys
+    c = client("eu-west-1")
+    assert_equal("https://my-bucket.s3.eu-west-1.amazonaws.com/a%20b/c%2Bd%3F%23%25", c.url_for("my-bucket", "a b/c+d?#%").to_s)
+    assert_equal("https://s3.eu-west-1.amazonaws.com/my.bucket/%C3%BC/x", c.url_for("my.bucket", "ü/x").to_s)
+    assert_equal("/a/./b/../c", AWS::S3.key_path("a/./b/../c"))
+    assert_equal("//lead", AWS::S3.key_path("/lead"))
+    assert_equal("/a//b/", AWS::S3.key_path("a//b/"))
+    assert_equal("/%E6%97%A5%E6%9C%AC", AWS::S3.key_path("日本"))
+    # An empty key would name the bucket (a bucket operation): refused in
+    # both styles; a key of `/` names an object.
+    assert_raise(ArgumentError) { c.url_for("my-bucket", "") }
+    assert_raise(ArgumentError) { c.url_for("my.bucket", "") }
+    assert_raise(ArgumentError) { c.put_request(bucket: "my-bucket", key: "", body: "x") }
+    assert_equal("https://my-bucket.s3.eu-west-1.amazonaws.com//", c.url_for("my-bucket", "/").to_s)
+    assert_equal("https://s3.eu-west-1.amazonaws.com/my.bucket//", c.url_for("my.bucket", "/").to_s)
+    fake = FakeS3.make
+    S3Fakes.with(fake) do |s3|
+      assert_raise(ArgumentError) { s3.put_object(bucket: "bkt", key: "", body: "x") }
+      assert_equal(0, fake.seen.get.size)
+      ["a/./b/../c", "/lead", "a//b", "sp ace+plus?q#h%p", "ü/日本", "/"].each do |key|
+        s3.put_object(bucket: "bkt", key: key, body: "x")
+      end
+      targets = fake.seen.get.map { |r| r.target }
+      assert_equal(["/bkt/a/./b/../c", "/bkt//lead", "/bkt/a//b", "/bkt/sp%20ace%2Bplus%3Fq%23h%25p", "/bkt/%C3%BC/%E6%97%A5%E6%9C%AC", "/bkt//"], targets)
+    end
+  end
+
+  def test_put_object_against_a_stand_in
+    fake = FakeS3.make
+    S3Fakes.with(fake) do |s3|
+      out = s3.put_object(bucket: "exports", key: "2026/11/26.json", body: b"{\"n\":1}", content_type: "application/json",
+                          object_lock_mode: :governance, object_lock_retain_until_date: Time.utc(2027, 2, 3, 4, 5, 6),
+                          expected_bucket_owner: "123456789012", metadata: {"Origin" => "daily"})
+      assert_equal("\"etag-1\"", out.etag)
+      assert_equal("v-1", out.version_id)
+      assert_equal(AWS::S3::Checksum.new(:sha256, Base64.encode(Digest::SHA256.digest(b"{\"n\":1}"))), out.checksum)
+      req = fake.seen.get[0]
+      assert_equal("PUT", req.method)
+      assert_equal("/exports/2026/11/26.json", req.target)
+      assert_equal(["GOVERNANCE", "2027-02-03T04:05:06.000Z", "123456789012", "daily", "application/json"],
+                   ["x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date", "x-amz-expected-bucket-owner", "x-amz-meta-origin", "content-type"].map { |n| req.headers[n] || "" })
+      assert_equal(b"{\"n\":1}", fake.bodies.get[0])
+      # Content-MD5: S3 gave no checksum back.
+      assert_nil(s3.put_object(bucket: "exports", key: "k", body: "x", checksum: :md5).checksum)
+      assert(!out.inspect.include?("{"), out.inspect)
+    end
+  end
+
+  def test_errors_and_retries
+    fake = FakeS3.make
+    S3Fakes.with(fake) do |s3|
+      fake.script.set(["slowdown", "slowdown"])
+      assert_equal("v-1", s3.put_object(bucket: "b-1", key: "k", body: "x").version_id)
+      assert_equal(3, fake.seen.get.size)
+      [["denied", "AccessDenied", 403], ["nobucket", "NoSuchBucket", 404], ["locked", "InvalidRequest", 400]].each do |c|
+        fake.script.set([c[0]])
+        before = fake.seen.get.size
+        e = assert_raise(AWS::ServiceError) { s3.put_object(bucket: "b-1", key: "k", body: "secret body") }.as(AWS::ServiceError)
+        assert_equal([c[1], c[2], "req-err"], [e.code, e.status, e.request_id || ""])
+        assert(!e.message.include?("secret body"), e.message)
+        # Not tried again.
+        assert_equal(before + 1, fake.seen.get.size)
+      end
+      fake.script.set(["redirect"])
+      e = assert_raise(AWS::S3::WrongRegion) { s3.put_object(bucket: "b-1", key: "k", body: "x") }.as(AWS::S3::WrongRegion)
+      assert_equal(["PermanentRedirect", 301, "eu-west-1"], [e.code, e.status, e.region || ""])
+      assert_match(/the bucket is in eu-west-1/, e.message)
+      fake.script.set(["authmal"])
+      e = assert_raise(AWS::S3::WrongRegion) { s3.put_object(bucket: "b-1", key: "k", body: "x") }.as(AWS::S3::WrongRegion)
+      assert_equal(["AuthorizationHeaderMalformed", "ap-northeast-1"], [e.code, e.region || ""])
+      # An answer past the bound: a TransportError, not tried again.
+      fake.script.set(["big"])
+      before = fake.seen.get.size
+      t = assert_raise(AWS::TransportError) { s3.put_object(bucket: "b-1", key: "k", body: "x") }
+      assert_equal("S3 PutObject: answered more than 65536 bytes", t.message)
+      assert_equal(before + 1, fake.seen.get.size)
+    end
+    # The clock corrected once, from the Date of RequestTimeTooSkewed.
+    fake2 = FakeS3.make
+    S3Fakes.with(fake2) do |s3|
+      fake2.script.set(["skew"])
+      assert_equal("v-1", s3.put_object(bucket: "b-1", key: "k", body: "x").version_id)
+      dates = fake2.seen.get.map { |r| r.headers["x-amz-date"] || "" }
+      assert_equal(2, dates.size)
+      assert(dates[1] > dates[0], dates.inspect)
+    end
+    # Throttling past the retries.
+    S3Fakes.with(fake, retries: 1) do |s3|
+      fake.script.set(["slowdown", "slowdown"])
+      e = assert_raise(AWS::ServiceError) { s3.put_object(bucket: "b-1", key: "k", body: "x") }.as(AWS::ServiceError)
+      assert_equal(["SlowDown", 503], [e.code, e.status])
+    end
+  end
+
+  # Nothing that is not a bucket name, an account id or a header value
+  # reaches the request: an ArgumentError before anything is sent, the
+  # value of a metadata entry or a header never in the message.
+  def test_arguments_are_checked_before_sending
+    c = client
+    ["ab", "a" * 64, "Upper", "a_b", "a..b", ".ab", "ab-", "192.168.1.1", "a/b", "a@b", "a:b", "a?b", "a#b", ""].each do |b|
+      assert_raise(ArgumentError) { c.put_request(bucket: b, key: "k", body: "x") }
+    end
+    c.put_request(bucket: "abc", key: "k", body: "x")
+    c.put_request(bucket: "a" * 63, key: "k", body: "x")
+    c.put_request(bucket: "my.bucket-1", key: "k", body: "x")
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", expected_bucket_owner: "12345") }
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", object_lock_mode: :governance) }
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", object_lock_retain_until_date: Time.now) }
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", object_lock_mode: :forever, object_lock_retain_until_date: Time.now) }
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", checksum: :crc32) }
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", server_side_encryption: :rot13) }
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", ssekms_key_id: "k1") }
+    e = assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", metadata: {"note" => "café-secret"}) }
+    assert_equal("metadata: the value of \"note\" is not printable ASCII", e.message)
+    e = assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", metadata: {"note" => "a\r\nX-Evil: 1"}) }
+    assert(!e.message.include?("Evil"), e.message)
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", metadata: {"bad name" => "v"}) }
+    # Other header values: refused by HTTP::Headers for CR, LF and other
+    # control characters, the value left out of the message.
+    e = assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", content_type: "text/plain\r\nX-Evil: secret") }
+    assert(!e.message.include?("secret"), e.message)
+    assert_raise(ArgumentError) { c.put_request(bucket: "abc", key: "k", body: "x", server_side_encryption: :aws_kms, ssekms_key_id: "k\n1") }
+  end
+
+  def test_inspect_shows_no_state
+    assert_equal("#<AWS::S3 us-east-1>", client.inspect)
+  end
+end

@@ -1,0 +1,306 @@
+require "http"
+require "digest"
+require "base64"
+
+# Amazon S3: objects written to a bucket. Shareable: one per program,
+# used from any task. Made from a [Config] (region, credentials, and an
+# endpoint override for a local stand-in or an S3-compatible store),
+# built on the same transport as [AWS::KMS]: each attempt signed (SigV4,
+# the payload's SHA-256 signed, never `UNSIGNED-PAYLOAD`) and sent under
+# `config.timeout`, its answer read with a bound, throttling (`SlowDown`,
+# 503), 5xx answers, S3's `RequestTimeout` and transport errors tried
+# again with backoff, the clock corrected once for
+# `RequestTimeTooSkewed`. No redirect is followed.
+#
+# Addressing: virtual-hosted (`https://{bucket}.s3.{region}.amazonaws.com/{key}`)
+# by default; path style (`https://s3.{region}.amazonaws.com/{bucket}/{key}`)
+# for a bucket name with a dot (the wildcard certificate does not cover
+# it; AWS calls path style legacy, and keeps it working); and path style
+# at the endpoint when the config overrides it (`endpoint:`, or
+# `AWS_ENDPOINT_URL_S3`). Each segment of the key is percent-encoded
+# once, as SigV4 signs it for `s3`; nothing removes `.` or `..` segments
+# or merges slashes, so the request names exactly the key given.
+#
+# A large object: one PUT carries up to 5 GB, held in memory as one
+# [Bytes] and sent within `config.timeout` per attempt: raise the
+# timeout in the [Config] for large objects.
+#
+# ```
+# creds = AWS::Credentials.static(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+# s3 = AWS::S3.new(AWS::Config.new(region: "eu-west-1", credentials: creds))
+# s3.inspect   # => "#<AWS::S3 eu-west-1>"
+# ```
+class S3
+  include Shareable
+
+  # A checksum S3 gave: its algorithm (`:sha256`, `:sha1`, `:crc32`,
+  # `:crc32c`, `:crc64nvme`) and its value as S3 writes it (base64).
+  data Checksum = (algorithm: Symbol, value: String)
+
+  # `put_object`'s answer: the object's ETag (as S3 gives it, quoted),
+  # its version id (nil when the bucket has no versioning), and the
+  # checksum S3 gave back (nil when it gave none).
+  data PutObjectOutput = (etag: String, version_id: String?, checksum: Checksum?)
+
+  # The bucket is in another region than the request's: S3 answered 301
+  # `PermanentRedirect` or 400 `AuthorizationHeaderMalformed`, which is
+  # raised rather than followed. [region] is the bucket's, when S3 said
+  # it (`x-amz-bucket-region`, or the error's `Region`).
+  class WrongRegion < ServiceError
+    @region: String?
+
+    # The error, with the bucket's [region].
+    def initialize(*, code: String, message: String, status: Int, request_id: String? = nil, region: String? = nil)
+      @region = region
+      super(code: code, message: message, status: status, request_id: request_id)
+    end
+
+    # The bucket's region, when S3 said it.
+    def region -> String? = @region
+  end
+
+  # The most bytes read of an answer that is a document (an error, or
+  # `put_object`'s empty body).
+  ANSWER_LIMIT = 65_536
+  # The codes tried again, besides the 5xx statuses and 429 (S3's
+  # `RequestTimeout` is a 400 the SDKs try again).
+  RETRIED_CODES = ["SlowDown", "InternalError", "ServiceUnavailable", "RequestTimeout"]
+  # The codes that may mean the request's time is too far from the
+  # server's (corrected only when the server's Date says so).
+  SKEW_CODES = ["RequestTimeTooSkewed"]
+  # The checksums S3 may give back, by header (in the order looked at:
+  # the one sent first).
+  CHECKSUM_HEADERS = {sha256: "x-amz-checksum-sha256", crc64nvme: "x-amz-checksum-crc64nvme", crc32: "x-amz-checksum-crc32",
+                      crc32c: "x-amz-checksum-crc32c", sha1: "x-amz-checksum-sha1"}
+
+  @config: Config
+  # The endpoint the config overrides, if any: path style there.
+  @override: URI?
+  @transport: Transport
+
+  # A client for `config`'s region and credentials.
+  def initialize(@config: Config)
+    @override = config.service_endpoints["s3"]? || config.endpoint
+    @transport = Transport.new(config, "s3", RETRIED_CODES, SKEW_CODES)
+  end
+
+  # The configuration.
+  def config -> Config = @config
+
+  # `#<AWS::S3 eu-west-1>` (and the endpoint, when overridden): not the
+  # credentials' state.
+  def inspect -> String
+    if o = @override
+      "#<AWS::S3 #{@config.region} #{o}>"
+    else
+      "#<AWS::S3 #{@config.region}>"
+    end
+  end
+
+  # As [inspect].
+  def to_s -> String = inspect
+
+  # Writes `body` as the object `key` of `bucket`, in one PUT.
+  #
+  # - A checksum is always sent: `x-amz-checksum-sha256` (with
+  #   `x-amz-sdk-checksum-algorithm: SHA256`) by default, `Content-MD5`
+  #   with `checksum: :md5`; S3 refuses a PUT to a bucket with Object
+  #   Lock that has neither. The payload is signed too.
+  # - Object Lock: `object_lock_mode` (`:governance` or `:compliance`)
+  #   with `object_lock_retain_until_date`, both or neither;
+  #   `object_lock_legal_hold`.
+  # - `server_side_encryption` (`:aes256` or `:aws_kms`, with
+  #   `ssekms_key_id` for the latter only); `expected_bucket_owner` (an
+  #   account id: S3 refuses the PUT when the bucket is another's);
+  #   `metadata`, sent as `x-amz-meta-<name>`: names are header tokens,
+  #   values ASCII without control characters.
+  #
+  # A PUT tried again after an answer that was lost (a 5xx, a timeout, a
+  # connection dropped after the body was sent) may have been written
+  # twice: with versioning, which Object Lock requires, that is two
+  # versions of the object, and under a retention both stay. A caller
+  # that must not write twice sets `retries: 0` in the [Config].
+  #
+  # ## Raises
+  #
+  # [ArgumentError] before anything is sent, for a bucket name S3's
+  # rules refuse, an option outside its symbols, a lock mode without a
+  # date (or the reverse), a KMS key without `:aws_kms`, an owner that is
+  # not 12 digits, a metadata name or value that cannot be a header (the
+  # message names the key, never the value), or another header value
+  # with a control character. [WrongRegion] when the bucket is in
+  # another region; [ServiceError] for S3's other errors (match on
+  # `code`: `AccessDenied`, `NoSuchBucket`, `InvalidRequest`, ...);
+  # [TransportError] when no answer came.
+  def put_object(*, bucket: String, key: String, body: Bytes | String, content_type: String? = nil, checksum: Symbol = :sha256,
+                 object_lock_mode: Symbol? = nil, object_lock_retain_until_date: Time? = nil, object_lock_legal_hold: Bool? = nil,
+                 server_side_encryption: Symbol? = nil, ssekms_key_id: String? = nil, expected_bucket_owner: String? = nil,
+                 metadata: Hash[String, String] = Hash[String, String].new) -> PutObjectOutput
+    req = put_request(bucket: bucket, key: key, body: body, content_type: content_type, checksum: checksum,
+                      object_lock_mode: object_lock_mode, object_lock_retain_until_date: object_lock_retain_until_date,
+                      object_lock_legal_hold: object_lock_legal_hold, server_side_encryption: server_side_encryption,
+                      ssekms_key_id: ssekms_key_id, expected_bucket_owner: expected_bucket_owner, metadata: metadata)
+    answer = @transport.send(req, "S3 PutObject", ANSWER_LIMIT, ->(status: Int, h: HTTP::Headers, text: String) { S3.error(status, h, text) })
+    h = answer.headers
+    PutObjectOutput.new(h["etag"] || "", h["x-amz-version-id"], S3.checksum_of(h))
+  end
+
+  # :nodoc:
+  # The unsigned request `put_object` sends (signed at each attempt),
+  # its arguments checked.
+  def put_request(*, bucket: String, key: String, body: Bytes | String, content_type: String? = nil, checksum: Symbol = :sha256,
+                  object_lock_mode: Symbol? = nil, object_lock_retain_until_date: Time? = nil, object_lock_legal_hold: Bool? = nil,
+                  server_side_encryption: Symbol? = nil, ssekms_key_id: String? = nil, expected_bucket_owner: String? = nil,
+                  metadata: Hash[String, String] = Hash[String, String].new) -> HTTP::Client::Request
+    S3.check_bucket(bucket)
+    data = body.is_a?(String) ? body.as(String).to_bytes : body.as(Bytes)
+    headers = HTTP::Headers.empty
+    case checksum
+    in :sha256
+      headers = headers.put("x-amz-checksum-sha256", Base64.encode(Digest::SHA256.digest(data)))
+                       .put("x-amz-sdk-checksum-algorithm", "SHA256")
+    in :md5
+      headers = headers.put("content-md5", Base64.encode(Digest::MD5.digest(data)))
+    else
+      raise ArgumentError.new("checksum: :sha256 or :md5, not #{checksum.inspect}")
+    end
+    if t = content_type
+      headers = headers.put("content-type", t)
+    end
+    mode = object_lock_mode
+    until_date = object_lock_retain_until_date
+    if mode.nil? != until_date.nil?
+      raise ArgumentError.new("object_lock_mode and object_lock_retain_until_date go together")
+    end
+    if (m = mode) && (d = until_date)
+      text = case m
+             in :governance then "GOVERNANCE"
+             in :compliance then "COMPLIANCE"
+             else raise ArgumentError.new("object_lock_mode: :governance or :compliance, not #{m.inspect}")
+             end
+      headers = headers.put("x-amz-object-lock-mode", text).put("x-amz-object-lock-retain-until-date", S3.timestamp(d))
+    end
+    if (hold = object_lock_legal_hold).is_a?(Bool)
+      headers = headers.put("x-amz-object-lock-legal-hold", hold ? "ON" : "OFF")
+    end
+    if s = server_side_encryption
+      text = case s
+             in :aes256 then "AES256"
+             in :aws_kms then "aws:kms"
+             else raise ArgumentError.new("server_side_encryption: :aes256 or :aws_kms, not #{s.inspect}")
+             end
+      headers = headers.put("x-amz-server-side-encryption", text)
+    end
+    if k = ssekms_key_id
+      raise ArgumentError.new("ssekms_key_id goes with server_side_encryption: :aws_kms") unless server_side_encryption == :aws_kms
+      headers = headers.put("x-amz-server-side-encryption-aws-kms-key-id", k)
+    end
+    if owner = expected_bucket_owner
+      raise ArgumentError.new("expected_bucket_owner: an account id of 12 digits") unless owner.match?(/\A[0-9]{12}\z/)
+      headers = headers.put("x-amz-expected-bucket-owner", owner)
+    end
+    metadata.each do |name, value|
+      unless name.match?(/\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\z/)
+        raise ArgumentError.new("metadata: the name #{name.inspect} is not a header token")
+      end
+      unless value.bytes.all? { |b| b >= 0x20 && b < 0x7f }
+        raise ArgumentError.new("metadata: the value of #{name.inspect} is not printable ASCII")
+      end
+      headers = headers.put("x-amz-meta-#{name}", value)
+    end
+    req = HTTP::Client::Request.put(url_for(bucket, key), body: data)
+    headers.each { |n, v| req = req.header(n, v) }
+    req
+  end
+
+  # :nodoc:
+  # The URL of `key` in `bucket`: virtual-hosted, or path style for a
+  # dotted bucket name or an overridden endpoint (see the class). Every
+  # object operation's URL is made here. An empty key raises
+  # [ArgumentError]: its URL would name the bucket itself, which S3 reads
+  # as a bucket operation (a PUT as CreateBucket, a GET as ListObjects).
+  # A key of `/` is an object's (`//`, `/{bucket}//` in path style).
+  def url_for(bucket: String, key: String) -> URI
+    raise ArgumentError.new("key: empty (the URL would name the bucket, not an object)") if key.empty?
+    path = S3.key_path(key)
+    if o = @override
+      base = o.path.end_with?("/") ? o.path[0, o.path.size - 1] : o.path
+      return o.with(path: "#{base}/#{bucket}#{path}", query: nil)
+    end
+    region = @config.region
+    unless region.match?(/\A[a-z0-9]+(-[a-z0-9]+)*\z/)
+      raise ArgumentError, "not a region: #{region.inspect}"
+    end
+    if bucket.include?(".")
+      URI.parse("https://s3.#{region}.amazonaws.com/#{bucket}#{path}")
+    else
+      URI.parse("https://#{bucket}.s3.#{region}.amazonaws.com#{path}")
+    end
+  end
+
+  # :nodoc:
+  # `key` as a path: `/` and each segment percent-encoded once (every
+  # byte but the unreserved ones), as SigV4 signs it for `s3`. Empty,
+  # `.` and `..` segments stay as they are.
+  #
+  # ```
+  # AWS::S3.key_path("a b/ü/c+d")   # => "/a%20b/%C3%BC/c%2Bd"
+  # ```
+  def self.key_path(key: String) -> String = "/" + key.split("/", -1).map { |s| SigV4.encode(s) }.join("/")
+
+  # :nodoc:
+  # Raises [ArgumentError] unless `name` follows S3's naming rules: 3 to
+  # 63 characters, lower-case letters, digits, hyphens and dots, starting
+  # and ending with a letter or a digit, no `..`, not an IP address's
+  # form. (So no `/`, `@`, `:`, `?`, `#` or upper case reaches a URL.)
+  def self.check_bucket(name: String) -> Void
+    ok = name.match?(/\A[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\z/) && !name.include?("..") && !name.match?(/\A\d+\.\d+\.\d+\.\d+\z/)
+    raise ArgumentError.new("not a bucket name S3 takes: #{name.inspect}") unless ok
+  end
+
+  # :nodoc:
+  # `t` as Object Lock's date: ISO 8601, UTC, to the millisecond.
+  def self.timestamp(t: Time) -> String
+    u = t.utc
+    "#{u.strftime("%Y-%m-%dT%H:%M:%S")}.#{(u.nsec / 1_000_000).to_s.rjust(3, "0")}Z"
+  end
+
+  # :nodoc:
+  # The checksum an answer's headers give, the one sent first.
+  def self.checksum_of(h: HTTP::Headers) -> Checksum?
+    CHECKSUM_HEADERS.each do |alg, name|
+      if v = h[name]
+        return Checksum.new(alg, v)
+      end
+    end
+    nil
+  end
+
+  # :nodoc:
+  # The error of an answer: S3's XML document (`Code`, `Message`,
+  # `RequestId`), or the status alone when there is none (a HEAD, a
+  # 301, a proxy's page). Without S3's document the code is synthesized
+  # here, not S3's: `PermanentRedirect` for a 301, `SlowDown` for a 503
+  # (tried again through its status either way), `HTTP<status>` else. A
+  # wrong region raises [WrongRegion] naming the bucket's.
+  def self.error(status: Int, headers: HTTP::Headers, text: String) -> ServiceError
+    f = begin
+          XML.fields(text, ["Code", "Message", "RequestId", "Region"], ["Error"])
+        rescue XML::Refused
+          Hash[String, String].new
+        end
+    code = f["Code"]? || ""
+    code = status == 301 ? "PermanentRedirect" : (status == 503 ? "SlowDown" : "HTTP#{status}") if code.empty?
+    message = f["Message"]? || ""
+    request_id = f["RequestId"]? || headers["x-amz-request-id"]
+    if code == "PermanentRedirect" || code == "AuthorizationHeaderMalformed"
+      region = headers["x-amz-bucket-region"] || f["Region"]?
+      if code == "PermanentRedirect" || region
+        said = region ? "the bucket is in #{region}" : "the bucket is in another region"
+        return WrongRegion.new(code: code, message: message.empty? ? said : "#{said}: #{message}", status: status,
+                               request_id: request_id, region: region)
+      end
+    end
+    ServiceError.new(code: code, message: message, status: status, request_id: request_id)
+  end
+end

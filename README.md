@@ -3,7 +3,9 @@
 AWS for [Quarz](https://quarz.dev), written in Quarz over its standard
 library: credentials (the SDKs' chain), request signing (Signature
 Version 4, usable for any service), and service clients as modules of
-this cog, starting with KMS.
+this cog: KMS and S3. The clients share the transport (signing, the
+timeout, retries, the clock-skew correction, bounded reads), not each
+other.
 
 ```toml
 # Cog.toml of an application
@@ -205,6 +207,53 @@ box.open(sealed)
   The data key is 32 bytes (AES-256); the bytes before the ciphertext
   are its additional authenticated data.
 
+### S3
+
+```crystal
+s3 = AWS::S3.new(config)   # Shareable: one per program
+
+out = s3.put_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json", body: json,
+                    content_type: "application/json",
+                    object_lock_mode: :compliance, object_lock_retain_until_date: Time.now + 30.days,
+                    server_side_encryption: :aws_kms, ssekms_key_id: "alias/exports",
+                    expected_bucket_owner: "123456789012", metadata: {"source" => "daily"})
+out.etag; out.version_id; out.checksum   # an AWS::S3::Checksum(:sha256, base64), or nil
+```
+
+- `put_object(bucket:, key:, body:, ...)` writes one object in one PUT
+  (up to 5 GB, held in memory and sent within `config.timeout` per
+  attempt: raise the timeout in the Config for large objects). A
+  checksum is always sent: `x-amz-checksum-sha256` with
+  `x-amz-sdk-checksum-algorithm: SHA256` by default, `Content-MD5`
+  with `checksum: :md5` (S3 refuses a PUT to an Object Lock bucket with
+  neither); the payload is signed (`x-amz-content-sha256` is the body's
+  SHA-256). Object Lock: `object_lock_mode:` (`:governance`,
+  `:compliance`) with `object_lock_retain_until_date:`, and
+  `object_lock_legal_hold:`. `server_side_encryption:` (`:aes256`,
+  `:aws_kms` with `ssekms_key_id:`), `expected_bucket_owner:` (S3
+  refuses the PUT when the bucket is another account's), `metadata:`
+  (`x-amz-meta-*`: token names, printable ASCII values).
+- Virtual-hosted addressing (`https://{bucket}.s3.{region}.amazonaws.com/{key}`)
+  by default; path style for a bucket name with a dot (AWS calls it
+  legacy and keeps it working) and at an overridden endpoint
+  (`AWS_ENDPOINT_URL_S3`, a stand-in, an S3-compatible store). Each
+  segment of the key is percent-encoded once; nothing removes `.` or
+  `..` segments or merges slashes, so the request names exactly the key
+  given. An empty key (its URL would name the bucket, which S3 reads as
+  a bucket operation), a bucket name outside S3's rules, an account id that is not 12
+  digits, a symbol outside an option's, or a header value with a
+  control character is an `ArgumentError` before anything is sent.
+- Errors are S3's XML error documents as [AWS::ServiceError]s, matched
+  on `code` (`AccessDenied`, `NoSuchBucket`, `InvalidRequest` for the
+  Object Lock refusals, ...); a bucket in another region (301
+  `PermanentRedirect`, 400 `AuthorizationHeaderMalformed`) raises
+  [AWS::S3::WrongRegion] with the bucket's `region`, and no redirect
+  is followed. Throttling (`SlowDown`, 503), 5xx answers, S3's
+  `RequestTimeout` and transport errors are tried again with backoff.
+  A PUT tried again after an answer that was lost may have been written
+  twice: with versioning, which Object Lock requires, two versions of
+  the object (`retries: 0` in the Config to never send twice).
+
 ### Errors
 
 - [AWS::Error], the root of the errors this cog raises;
@@ -213,19 +262,23 @@ box.open(sealed)
   error: `code` (`NotFoundException`, the service's prefix dropped:
   match on it), `detail` (its message), `status`, `request_id`;
   [AWS::TransportError], a request that could not be made or answered
-  (the [HTTP::Client::Error]'s class in the message). No message holds
-  a request's body or keys.
+  (the [HTTP::Client::Error]'s class in the message), or an answer
+  larger than the client reads (not tried again). No message holds a
+  request's body or keys.
 
 ### Not there yet
 
-Other services (S3, SQS, STS beyond the credentials), presigned S3
-uploads beyond [AWS::SigV4.presign] itself, a data-key cache for
-[AWS::KMS::Envelope].
+S3's `get_object`, `head_object` and `list_objects_v2` (next), multipart
+uploads, bucket management, copy, delete and ACLs; other services
+(SQS, STS beyond the credentials); presigned S3 uploads beyond
+[AWS::SigV4.presign] itself; a data-key cache for [AWS::KMS::Envelope].
 
 ### Tests
 
 `quarz test` runs against fake endpoints (a fake KMS in Quarz that
-recomputes each request's signature) and temporary files. An opt-in
+recomputes each request's signature, a stand-in S3) and temporary
+files; S3's signatures are pinned against AWS's published example and
+independently computed values. An opt-in
 test against a real KMS reads `AWS_TEST_KMS_KEY_ID` (a symmetric key
 the environment's credentials may use, `kms:ReEncrypt*` included;
 `AWS_ENDPOINT_URL_KMS` for a local emulator) and is never run in CI.

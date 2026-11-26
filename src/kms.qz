@@ -34,6 +34,9 @@ class KMS
   # The codes tried again, besides the 5xx statuses and 429.
   RETRIED_CODES = ["ThrottlingException", "KMSInternalException", "DependencyTimeoutException", "RequestTimeout",
                    "TooManyRequestsException"]
+  # The most bytes read of an answer: KMS's are a few kilobytes (a
+  # public key, a ciphertext of up to 6 KB, base64).
+  ANSWER_LIMIT = 65_536
   # The codes that may mean the request's time is too far from the
   # server's (corrected only when the server's Date says so).
   SKEW_CODES = ["InvalidSignatureException", "SignatureDoesNotMatch", "RequestExpired", "RequestInTheFuture",
@@ -99,15 +102,14 @@ class KMS
 
   @config: Config
   @endpoint: URI
-  # The server's clock minus ours, in milliseconds, once an answer said
-  # they differ.
-  @skew: Atom[Int]
+  # Sends, signs, retries and corrects the clock ([AWS::Transport]).
+  @transport: Transport
 
   # A client for [config]'s region and credentials, at
   # `config.endpoint_for("kms")`.
   def initialize(@config: Config)
     @endpoint = config.endpoint_for("kms")
-    @skew = Atom.new(0)
+    @transport = Transport.new(config, "kms", RETRIED_CODES, SKEW_CODES)
   end
 
   # Where the requests go.
@@ -246,73 +248,14 @@ class KMS
   end
 
   # :nodoc:
-  # `operation`'s answer to `body`, tried again as the class says.
+  # `operation`'s answer to `body`, tried again as the class says
+  # ([AWS::Transport]).
   def call(operation: String, body: Hash[String, Object]) -> JSON::Value
-    json = JSON.generate(body)
-    attempt = 0
-    skewed = false
-    loop do
-      begin
-        used = @skew.get
-        status, headers, text = send_once(operation, json, used)
-      rescue TransportError => e
-        raise e if attempt >= @config.retries
-        backoff(attempt)
-        attempt += 1
-        next
-      end
-      if status >= 200 && status <= 299
-        return KMS.parse(text, operation, status)
-      end
-      error = KMS.error(status, headers, text)
-      if !skewed && KMS.skew?(error)
-        if server = Time.httpdate?(headers["date"] || "")
-          # (Corrected when the server's clock is over 4 minutes from
-          # ours as corrected so far, either way, as botocore does.)
-          diff = (server - Time.now).to_ms
-          # (Against the skew this request was signed with: another task
-          # may have corrected it since.)
-          if (diff - used).abs > 240_000
-            @skew.set(diff)
-            skewed = true
-            next
-          end
-        end
-      end
-      raise error unless attempt < @config.retries && KMS.retry?(error)
-      backoff(attempt)
-      attempt += 1
-    end
-  end
-
-  # :nodoc:
-  # One attempt: the status, headers and body of `operation`'s answer.
-  private def send_once(operation: String, json: String, skew: Int) -> [Int, HTTP::Headers, String]
     url = @endpoint.path.empty? ? @endpoint.with(path: "/") : @endpoint
-    req = HTTP::Client::Request.post(url, body: json, content_type: CONTENT_TYPE).header("X-Amz-Target", "#{TARGET}.#{operation}")
-    keys = @config.credentials.get
-    signed = SigV4.sign(req, service: "kms", region: @config.region, credentials: keys, time: Time.now + skew.milliseconds)
-    begin
-      Task.timeout(@config.timeout) do
-        res = @config.http.request(signed)
-        [res.status, res.headers, res.body.read]
-      end
-    rescue HTTP::Client::Error => e
-      raise TransportError.new("KMS #{operation}: #{e.class.name}: #{e.message}")
-    rescue Task::Timeout
-      raise TransportError.new("KMS #{operation}: no answer within #{@config.timeout}")
-    end
-  end
-
-  # :nodoc:
-  # Waits before retry `attempt` (from 0): a random time up to
-  # `min(retry_cap, retry_base * 2**attempt)`.
-  private def backoff(attempt: Int) -> Void
-    cap = @config.retry_cap.to_ms
-    ceiling = @config.retry_base.to_ms
-    attempt.times { ceiling = ceiling * 2 if ceiling < cap }
-    ceiling = cap if ceiling > cap
-    Task.sleep(Random.rand(0..ceiling).milliseconds) if ceiling > 0
+    req = HTTP::Client::Request.post(url, body: JSON.generate(body), content_type: CONTENT_TYPE).header("X-Amz-Target", "#{TARGET}.#{operation}")
+    what = "KMS #{operation}"
+    answer = @transport.send(req, what, ANSWER_LIMIT, ->(status: Int, headers: HTTP::Headers, text: String) { KMS.error(status, headers, text) })
+    KMS.parse(answer.text(what), operation, answer.status)
   end
 
   # :nodoc:
@@ -391,17 +334,6 @@ class KMS
     message = doc ? (doc["message"]?&.as_s? || doc["Message"]?&.as_s? || "") : ""
     ServiceError.new(code: code, message: message, status: status, request_id: headers["x-amzn-requestid"])
   end
-
-  # :nodoc:
-  def self.retry?(e: ServiceError) -> Bool
-    s = e.status
-    s == 429 || s == 500 || s == 502 || s == 503 || s == 504 || RETRIED_CODES.include?(e.code)
-  end
-
-  # :nodoc:
-  # Whether the answer may say the request's time is too far from the
-  # server's: its code; the server's Date decides.
-  def self.skew?(e: ServiceError) -> Bool = SKEW_CODES.include?(e.code)
 
   # Envelope encryption: each secret encrypted locally with AES-256-GCM
   # under a fresh data key from KMS (`generate_data_key`), the data key
