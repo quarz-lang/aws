@@ -50,6 +50,26 @@ class TransportTest < Test::Case
     end
   end
 
+  # A 2xx past `success_limit` without `too_large`: a TransportError, sent
+  # once; with it, the caller's error, sent once; an error answer keeps
+  # `read_limit`.
+  def test_success_limit_is_not_tried_again
+    with_stand_in(200, 50) do |t, url, calls|
+      e = assert_raise(AWS::TransportError) { t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of, success_limit: 10) }
+      assert_equal("Test Op: answered more than 10 bytes", e.message)
+      assert_equal(1, calls.get)
+      assert_raise(ArgumentError) {
+        t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of, success_limit: 10, too_large: ArgumentError.new("too big"))
+      }
+      assert_equal(2, calls.get)
+      assert_equal(50, t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of, success_limit: 50).body.size)
+    end
+    with_stand_in(500, 50) do |t, url, calls|
+      e = assert_raise(AWS::ServiceError) { t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of, success_limit: 10) }
+      assert_equal(4, calls.get)
+    end
+  end
+
   def test_a_retried_code_is_tried_again
     with_stand_in(400, 2) do |t, url, calls|
       e = assert_raise(AWS::ServiceError) { t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of) }.as(AWS::ServiceError)

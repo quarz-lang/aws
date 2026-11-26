@@ -157,6 +157,11 @@ class S3GetTest < Test::Case
       e = assert_raise(AWS::S3::ObjectTooLarge) { s3.get_object(bucket: "b-1", key: "k", max_bytes: BODY.size - 1) }
       assert_equal("S3 GetObject: the object is larger than max_bytes (#{BODY.size - 1})", e.message)
       assert_equal(before + 1, fake.seen.get.size)
+      # The refused answer's connection is not reused with its body unread:
+      # the next requests on the same client get their own answers whole.
+      assert_equal(BODY, s3.get_object(bucket: "b-1", key: "k", max_bytes: BODY.size).body)
+      assert_equal(BODY.size, s3.head_object(bucket: "b-1", key: "k").content_length)
+      assert_equal(before + 3, fake.seen.get.size)
       # An error document is read with its own bound, whatever max_bytes.
       e2 = assert_raise(AWS::ServiceError) { s3.get_object(bucket: "b-1", key: "missing", max_bytes: 1) }.as(AWS::ServiceError)
       assert_equal(["NoSuchKey", 404, "req-404"], [e2.code, e2.status, e2.request_id || ""])

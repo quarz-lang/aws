@@ -42,6 +42,12 @@ class Transport
     def to_s -> String = inspect
   end
 
+  # :nodoc:
+  # A 2xx answer past `send`'s `success_limit`, left by `once` to `send`,
+  # which raises the caller's error for it without trying again.
+  class PastBound < StandardError
+  end
+
   @config: Config
   @service: String
   @retried: Array[String]
@@ -74,11 +80,13 @@ class Transport
     loop do
       used = @skew.get
       answer = begin
-                 once(request, what, read_limit, used, success_limit, too_large)
+                 once(request, what, read_limit, used, success_limit)
                rescue HTTP::Client::ResponseTooLarge
                  # (Not tried again: the same request would get the same
                  # answer.)
                  raise TransportError.new("#{what}: answered more than #{read_limit} bytes")
+               rescue PastBound
+                 raise too_large || TransportError.new("#{what}: answered more than #{success_limit || read_limit} bytes")
                rescue TransportError => e
                  raise e if attempt >= @config.retries
                  backoff(attempt)
@@ -114,10 +122,15 @@ class Transport
   end
 
   # One attempt: `request` signed with the skew `skew`, sent, its answer
-  # read within `read_limit` bytes (a 2xx within `success_limit`, else
-  # `too_large`), under the timeout.
+  # read within `read_limit` bytes (a 2xx within `success_limit`), under
+  # the timeout. An answer past a bound leaves as what `send` does not
+  # try again: [HTTP::Client::ResponseTooLarge], or [PastBound] for a
+  # 2xx past `success_limit` (by its Content-Length before any of it is
+  # read, or while reading). The response is then dropped unread, which
+  # closes its connection rather than giving it back to the client's
+  # pool ([HTTP::Client::Response]).
   private def once(request: HTTP::Client::Request, what: String, read_limit: Int, skew: Int,
-                   success_limit: Int?, too_large: Exception?) -> Answer
+                   success_limit: Int?) -> Answer
     keys = @config.credentials.get
     signed = SigV4.sign(request, service: @service, region: @config.region, credentials: keys, time: Time.now + skew.milliseconds)
     begin
@@ -125,14 +138,13 @@ class Transport
         res = @config.http.request(signed)
         ok = res.status >= 200 && res.status <= 299
         if ok && (limit = success_limit)
-          big = too_large || TransportError.new("#{what}: answered more than #{limit} bytes")
           if (n = res.headers["content-length"]) && n.match?(/\A[0-9]{1,18}\z/) && n.to_i > limit
-            raise big
+            raise PastBound.new("")
           end
           body = begin
                    res.body.read_bytes(max: limit)
                  rescue HTTP::Client::ResponseTooLarge
-                   raise big
+                   raise PastBound.new("")
                  end
           Answer.new(res.status, res.headers, body)
         else
@@ -142,6 +154,8 @@ class Transport
     rescue HTTP::Client::ResponseTooLarge => tl
       # (Left to `send`, which does not try it again.)
       raise tl
+    rescue PastBound => pb
+      raise pb
     rescue HTTP::Client::Error => e
       raise TransportError.new("#{what}: #{e.class.name}: #{e.message}")
     rescue Task::Timeout
