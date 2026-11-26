@@ -120,7 +120,7 @@ end
 # :nodoc:
 # The two STS calls the credentials providers make (`AssumeRole`,
 # `AssumeRoleWithWebIdentity`): the Query protocol, a form POSTed, the
-# keys read from the XML answer (`STSXML`).
+# keys read from the XML answer ([AWS::XML]).
 module STS
   # The endpoint: `AWS_ENDPOINT_URL_STS` or `AWS_ENDPOINT_URL`, else the
   # regional one for `region`, the global one without.
@@ -158,14 +158,18 @@ module STS
                    end
     unless status >= 200 && status <= 299
       f: Hash[String, String] = begin
-                                  STSXML.fields(body, ["Code", "Message"])
-                                rescue CredentialsError
+                                  XML.fields(body, ["Code", "Message"])
+                                rescue XML::Refused
                                   {}
                                 end
       raise CredentialsError.new("STS #{action} answered #{status}#{f["Code"]? ? ": #{f["Code"]}" : ""}#{f["Message"]? ? " (#{f["Message"]})" : ""}")
     end
     # (The keys under the result's `Credentials` only.)
-    f = STSXML.fields(body, ["AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"], [result, "Credentials"])
+    f = begin
+          XML.fields(body, ["AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"], [result, "Credentials"])
+        rescue XML::Refused => e
+          raise CredentialsError.new("STS answered XML this reader does not take: #{e.message}")
+        end
     id = f["AccessKeyId"]?
     secret = f["SecretAccessKey"]?
     token = f["SessionToken"]?
