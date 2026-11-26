@@ -24,5 +24,11 @@ class KMSRealTest < Test::Case
     assert_equal(("x" * 5000).to_bytes, box.open(box.seal("x" * 5000)))
     assert(client.describe_key(key_id: k).enabled?)
     assert_equal(16, client.generate_random(number_of_bytes: 16).plaintext.size)
+    # re_encrypt to the same key under another context (a second account
+    # is not needed for that): the same data key, its plaintext never out.
+    moved = client.re_encrypt(ciphertext_blob: dk.ciphertext_blob, destination_key_id: k, source_encryption_context: ctx,
+                              destination_encryption_context: {"purpose" => "quarz-aws-test-moved"})
+    assert_equal(dk.plaintext, client.decrypt(ciphertext_blob: moved.ciphertext_blob,
+                                              encryption_context: {"purpose" => "quarz-aws-test-moved"}).plaintext)
   end
 end

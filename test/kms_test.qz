@@ -69,8 +69,10 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
       end
     end
     doc = JSON.parse(body)
-    key = doc["KeyId"]?&.as_s?
+    # (ReEncrypt names its key `DestinationKeyId`.)
+    key = doc["KeyId"]?&.as_s? || doc["DestinationKeyId"]?&.as_s?
     return FakeKMS.error(400, "NotFoundException", "Key '#{key}' does not exist", now) if key == "alias/missing"
+    return FakeKMS.error(400, "DisabledException", "#{key} is disabled.", now) if key == "alias/disabled"
     if key == "alias/denied"
       return HTTP::Server::Response.text("{\"message\":\"not allowed\"}", 400).header("x-amzn-ErrorType", "AccessDeniedException:http://internal.amazon.com/coral/com.amazon.coral.service/")
                                                                        .header("x-amzn-RequestId", "req-denied")
@@ -100,6 +102,26 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
         return FakeKMS.error(400, "IncorrectKeyException", "", now)
       end
       FakeKMS.json({"Plaintext" => parts[3], "KeyId" => parts[1], "EncryptionAlgorithm" => "SYMMETRIC_DEFAULT"})
+    in "TrentService.ReEncrypt"
+      # (As KMS: the source context must be the blob's, a SourceKeyId the
+      # key it is under; the plaintext stays here.)
+      raise "a plaintext in a ReEncrypt request" if body.include?("Plaintext")
+      blob = Base64.decode(doc["CiphertextBlob"].as_s)
+      parts = (blob.decode? || "").split("|", 4)
+      source_ctx = doc["SourceEncryptionContext"]?
+      source_json = source_ctx ? source_ctx.to_json : "{}"
+      if parts.size != 4 || parts[0] != "fakeblob" || parts[2] != source_json
+        return FakeKMS.error(400, "InvalidCiphertextException", "", now)
+      end
+      if (s = doc["SourceKeyId"]?&.as_s?) && arn_for(s) != parts[1]
+        return FakeKMS.error(400, "IncorrectKeyException", "", now)
+      end
+      dest_ctx = doc["DestinationEncryptionContext"]?
+      arn = arn_for(key)
+      moved = FakeKMS.blob(arn, dest_ctx ? dest_ctx.to_json : "{}", Base64.decode(parts[3]))
+      FakeKMS.json({"CiphertextBlob" => Base64.encode(moved), "KeyId" => arn, "SourceKeyId" => parts[1],
+                    "SourceEncryptionAlgorithm" => doc["SourceEncryptionAlgorithm"]?&.as_s? || "SYMMETRIC_DEFAULT",
+                    "DestinationEncryptionAlgorithm" => doc["DestinationEncryptionAlgorithm"]?&.as_s? || "SYMMETRIC_DEFAULT"})
     in "TrentService.GenerateDataKey" | "TrentService.GenerateDataKeyWithoutPlaintext"
       size = doc["NumberOfBytes"]?&.as_i? || (doc["KeySpec"]?&.as_s? == "AES_128" ? 16 : 32)
       plain = Crypto.random_bytes(size)
@@ -197,6 +219,51 @@ class KMSTest < Test::Case
       assert_equal("InvalidCiphertextException", e.code)
       assert_equal(400, e.status)
       assert_equal(["TrentService.Encrypt", "TrentService.Decrypt", "TrentService.Decrypt"], fake.seen.get)
+    end
+  end
+
+  # aws#30: a ciphertext moved to another key, the plaintext never in the
+  # request or the answer.
+  def test_re_encrypt
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      dk = kms.generate_data_key(key_id: "alias/app", encryption_context: ctx)
+      moved = kms.re_encrypt(ciphertext_blob: dk.ciphertext_blob, destination_key_id: FakeKMS::OTHER_ARN,
+                             source_encryption_context: ctx, destination_encryption_context: {"backup" => "b1"})
+      assert_equal(FakeKMS::OTHER_ARN, moved.key_id)
+      assert_equal(FakeKMS::ARN, moved.source_key_id)
+      assert_equal(["SYMMETRIC_DEFAULT", "SYMMETRIC_DEFAULT"], [moved.source_encryption_algorithm, moved.destination_encryption_algorithm])
+      # The same data key, under the other key and its context.
+      back = kms.decrypt(ciphertext_blob: moved.ciphertext_blob, encryption_context: {"backup" => "b1"})
+      assert_equal(dk.plaintext, back.plaintext)
+      assert_equal(FakeKMS::OTHER_ARN, back.key_id)
+      # The source key and the algorithms are sent when given.
+      again = kms.re_encrypt(ciphertext_blob: moved.ciphertext_blob, destination_key_id: "alias/app", source_key_id: FakeKMS::OTHER_ARN,
+                             source_encryption_context: {"backup" => "b1"}, source_encryption_algorithm: :symmetric_default,
+                             destination_encryption_algorithm: :symmetric_default, grant_tokens: ["g1"])
+      assert_equal(FakeKMS::ARN, again.key_id)
+      # Errors, as KMS gives them.
+      e = assert_raise(AWS::ServiceError) { kms.re_encrypt(ciphertext_blob: dk.ciphertext_blob, destination_key_id: FakeKMS::OTHER_ARN) }.as(AWS::ServiceError)
+      assert_equal("InvalidCiphertextException", e.code)
+      e = assert_raise(AWS::ServiceError) do
+        kms.re_encrypt(ciphertext_blob: dk.ciphertext_blob, destination_key_id: FakeKMS::OTHER_ARN, source_encryption_context: ctx,
+                       source_key_id: FakeKMS::OTHER_ARN)
+      end.as(AWS::ServiceError)
+      assert_equal("IncorrectKeyException", e.code)
+      [["alias/missing", "NotFoundException"], ["alias/disabled", "DisabledException"], ["alias/denied", "AccessDeniedException"]].each do |pair|
+        e = assert_raise(AWS::ServiceError) { kms.re_encrypt(ciphertext_blob: dk.ciphertext_blob, destination_key_id: pair[0], source_encryption_context: ctx) }.as(AWS::ServiceError)
+        assert_equal(pair[1], e.code)
+        assert(!e.message.include?(Base64.encode(dk.ciphertext_blob)), e.message)
+      end
+      assert_equal(["TrentService.GenerateDataKey", "TrentService.ReEncrypt", "TrentService.Decrypt", "TrentService.ReEncrypt"], fake.seen.get.take(4))
+    end
+    # Throttling is tried again, as for the other operations.
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      dk = kms.generate_data_key_without_plaintext(key_id: "alias/app")
+      fake.script.set(["throttle", "503"])
+      assert_equal(FakeKMS::OTHER_ARN, kms.re_encrypt(ciphertext_blob: dk.ciphertext_blob, destination_key_id: FakeKMS::OTHER_ARN).key_id)
+      assert_equal(4, fake.calls.get)
     end
   end
 
