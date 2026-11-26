@@ -4,7 +4,8 @@ require "base64"
 require "crypto"
 
 # AWS Key Management Service: keys that never leave it, used to encrypt,
-# decrypt, make data keys, sign and verify. Shareable: one per program,
+# decrypt, move a ciphertext to another key without its plaintext
+# ([re_encrypt]), make data keys, sign and verify. Shareable: one per program,
 # used from any task.
 #
 # ```
@@ -65,6 +66,12 @@ class KMS
 
   # `generate_data_key_without_plaintext`'s answer.
   data EncryptedDataKey = (ciphertext_blob: Bytes, key_id: String)
+
+  # A ciphertext moved to another key ([re_encrypt]): the new ciphertext,
+  # the destination key (`key_id`), the key it was under before, and the
+  # algorithms used on each side.
+  data ReEncryptOutput = (ciphertext_blob: Bytes, key_id: String, source_key_id: String,
+                          source_encryption_algorithm: String, destination_encryption_algorithm: String)
 
   # `sign`'s answer.
   data SignOutput = (signature: Bytes, key_id: String, signing_algorithm: String)
@@ -141,6 +148,39 @@ class KMS
     end
     r = call("Decrypt", body)
     DecryptOutput.new(KMS.secret(r, "Plaintext"), KMS.str(r, "KeyId"), KMS.str(r, "EncryptionAlgorithm"))
+  end
+
+  # `ciphertext_blob` decrypted and encrypted again under
+  # `destination_key_id` (an id, an ARN or `alias/name`; a key of another
+  # account too) inside KMS: the plaintext is in neither the request nor
+  # the answer, so a data key can move to another key without leaving
+  # KMS. The source key is the one the blob names; `source_key_id` is
+  # needed for an asymmetric one. Each side has its encryption context
+  # and, optionally, its algorithm. There is no fallback that decrypts
+  # and encrypts here: an account without `kms:ReEncrypt*` gets KMS's
+  # error ([ServiceError]).
+  def re_encrypt(*, ciphertext_blob: Bytes, destination_key_id: String,
+                 source_encryption_context: Hash[String, String] = Hash[String, String].new,
+                 destination_encryption_context: Hash[String, String] = Hash[String, String].new,
+                 source_key_id: String? = nil, source_encryption_algorithm: Symbol? = nil,
+                 destination_encryption_algorithm: Symbol? = nil,
+                 grant_tokens: Array[String] = Array[String].new) -> ReEncryptOutput
+    body: Hash[String, Object] = {"CiphertextBlob" => Base64.encode(ciphertext_blob).as(Object), "DestinationKeyId" => destination_key_id.as(Object)}
+    body = body.merge({"SourceEncryptionContext" => source_encryption_context.as(Object)}) unless source_encryption_context.empty?
+    body = body.merge({"DestinationEncryptionContext" => destination_encryption_context.as(Object)}) unless destination_encryption_context.empty?
+    if k = source_key_id
+      body = body.merge({"SourceKeyId" => k.as(Object)})
+    end
+    if a = source_encryption_algorithm
+      body = body.merge({"SourceEncryptionAlgorithm" => KMS.enum(a).as(Object)})
+    end
+    if a = destination_encryption_algorithm
+      body = body.merge({"DestinationEncryptionAlgorithm" => KMS.enum(a).as(Object)})
+    end
+    body = body.merge({"GrantTokens" => grant_tokens.as(Object)}) unless grant_tokens.empty?
+    r = call("ReEncrypt", body)
+    ReEncryptOutput.new(KMS.bytes(r, "CiphertextBlob"), KMS.str(r, "KeyId"), KMS.str(r, "SourceKeyId"),
+                        KMS.str(r, "SourceEncryptionAlgorithm"), KMS.str(r, "DestinationEncryptionAlgorithm"))
   end
 
   # A data key (`key_spec` `:aes_256` or `:aes_128`, or `number_of_bytes`)

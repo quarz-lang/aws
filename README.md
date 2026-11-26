@@ -135,6 +135,8 @@ out = kms.encrypt(key_id: "alias/app", plaintext: secret, encryption_context: {"
 kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: {"tenant" => "t1"}).plaintext   # a Bytes::Secret: wipe it when done
 
 dk = kms.generate_data_key(key_id: "alias/app", key_spec: :aes_256)   # dk.plaintext (a Bytes::Secret), dk.ciphertext_blob
+# The same data key under a key of another account, its plaintext never out of KMS
+moved = kms.re_encrypt(ciphertext_blob: dk.ciphertext_blob, destination_key_id: "arn:aws:kms:eu-west-1:210987654321:key/...")
 sig = kms.sign(key_id: "alias/sign", message: bytes, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256).signature
 kms.verify(key_id: "alias/sign", message: bytes, signature: sig, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256)   # => Bool
 pub = kms.get_public_key(key_id: "alias/sign")                 # pub.public_key: DER, Crypto::RSA::PublicKey.from_der
@@ -147,7 +149,10 @@ box.open(sealed)
 ```
 
 - KMS's JSON 1.1 protocol (`POST /`, `X-Amz-Target: TrentService.<Operation>`),
-  signed with SigV4. The operations: `encrypt`, `decrypt`,
+  signed with SigV4. The operations: `encrypt`, `decrypt`, `re_encrypt`
+  (a ciphertext decrypted and encrypted again under another key, a key
+  of another account included, inside KMS: the plaintext is in neither
+  the request nor the answer, and nothing here decrypts instead),
   `generate_data_key`, `generate_data_key_without_plaintext`, `sign`,
   `verify` (`false` for `KMSInvalidSignatureException`),
   `get_public_key`, `describe_key`, `generate_random`; keyword
@@ -222,8 +227,8 @@ uploads beyond [AWS::SigV4.presign] itself, a data-key cache for
 `quarz test` runs against fake endpoints (a fake KMS in Quarz that
 recomputes each request's signature) and temporary files. An opt-in
 test against a real KMS reads `AWS_TEST_KMS_KEY_ID` (a symmetric key
-the environment's credentials may use; `AWS_ENDPOINT_URL_KMS` for a
-local emulator) and is never run in CI.
+the environment's credentials may use, `kms:ReEncrypt*` included;
+`AWS_ENDPOINT_URL_KMS` for a local emulator) and is never run in CI.
 
 ## License
 
