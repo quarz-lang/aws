@@ -215,8 +215,13 @@ class S3
 
   # :nodoc:
   # The URL of `key` in `bucket`: virtual-hosted, or path style for a
-  # dotted bucket name or an overridden endpoint (see the class).
+  # dotted bucket name or an overridden endpoint (see the class). Every
+  # object operation's URL is made here. An empty key raises
+  # [ArgumentError]: its URL would name the bucket itself, which S3 reads
+  # as a bucket operation (a PUT as CreateBucket, a GET as ListObjects).
+  # A key of `/` is an object's (`//`, `/{bucket}//` in path style).
   def url_for(bucket: String, key: String) -> URI
+    raise ArgumentError.new("key: empty (the URL would name the bucket, not an object)") if key.empty?
     path = S3.key_path(key)
     if o = @override
       base = o.path.end_with?("/") ? o.path[0, o.path.size - 1] : o.path
@@ -274,7 +279,10 @@ class S3
   # :nodoc:
   # The error of an answer: S3's XML document (`Code`, `Message`,
   # `RequestId`), or the status alone when there is none (a HEAD, a
-  # 301). A wrong region raises [WrongRegion] naming the bucket's.
+  # 301, a proxy's page). Without S3's document the code is synthesized
+  # here, not S3's: `PermanentRedirect` for a 301, `SlowDown` for a 503
+  # (tried again through its status either way), `HTTP<status>` else. A
+  # wrong region raises [WrongRegion] naming the bucket's.
   def self.error(status: Int, headers: HTTP::Headers, text: String) -> ServiceError
     f = begin
           XML.fields(text, ["Code", "Message", "RequestId", "Region"], ["Error"])

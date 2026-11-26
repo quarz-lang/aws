@@ -145,13 +145,22 @@ class S3Test < Test::Case
     assert_equal("//lead", AWS::S3.key_path("/lead"))
     assert_equal("/a//b/", AWS::S3.key_path("a//b/"))
     assert_equal("/%E6%97%A5%E6%9C%AC", AWS::S3.key_path("日本"))
+    # An empty key would name the bucket (a bucket operation): refused in
+    # both styles; a key of `/` names an object.
+    assert_raise(ArgumentError) { c.url_for("my-bucket", "") }
+    assert_raise(ArgumentError) { c.url_for("my.bucket", "") }
+    assert_raise(ArgumentError) { c.put_request(bucket: "my-bucket", key: "", body: "x") }
+    assert_equal("https://my-bucket.s3.eu-west-1.amazonaws.com//", c.url_for("my-bucket", "/").to_s)
+    assert_equal("https://s3.eu-west-1.amazonaws.com/my.bucket//", c.url_for("my.bucket", "/").to_s)
     fake = FakeS3.make
     S3Fakes.with(fake) do |s3|
-      ["a/./b/../c", "/lead", "a//b", "sp ace+plus?q#h%p", "ü/日本"].each do |key|
+      assert_raise(ArgumentError) { s3.put_object(bucket: "bkt", key: "", body: "x") }
+      assert_equal(0, fake.seen.get.size)
+      ["a/./b/../c", "/lead", "a//b", "sp ace+plus?q#h%p", "ü/日本", "/"].each do |key|
         s3.put_object(bucket: "bkt", key: key, body: "x")
       end
       targets = fake.seen.get.map { |r| r.target }
-      assert_equal(["/bkt/a/./b/../c", "/bkt//lead", "/bkt/a//b", "/bkt/sp%20ace%2Bplus%3Fq%23h%25p", "/bkt/%C3%BC/%E6%97%A5%E6%9C%AC"], targets)
+      assert_equal(["/bkt/a/./b/../c", "/bkt//lead", "/bkt/a//b", "/bkt/sp%20ace%2Bplus%3Fq%23h%25p", "/bkt/%C3%BC/%E6%97%A5%E6%9C%AC", "/bkt//"], targets)
     end
   end
 

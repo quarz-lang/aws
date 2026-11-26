@@ -239,7 +239,8 @@ out.etag; out.version_id; out.checksum   # an AWS::S3::Checksum(:sha256, base64)
   (`AWS_ENDPOINT_URL_S3`, a stand-in, an S3-compatible store). Each
   segment of the key is percent-encoded once; nothing removes `.` or
   `..` segments or merges slashes, so the request names exactly the key
-  given. A bucket name outside S3's rules, an account id that is not 12
+  given. An empty key (its URL would name the bucket, which S3 reads as
+  a bucket operation), a bucket name outside S3's rules, an account id that is not 12
   digits, a symbol outside an option's, or a header value with a
   control character is an `ArgumentError` before anything is sent.
 - Errors are S3's XML error documents as [AWS::ServiceError]s, matched
