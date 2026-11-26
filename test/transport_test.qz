@@ -1,0 +1,65 @@
+require "test"
+
+# AWS::Transport, the part the clients share (aws#31): what a bound on
+# the answer does, and which failures are tried again.
+class TransportTest < Test::Case
+  KEY_ID = "AKIDEXAMPLE"
+  SECRET = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+
+  # A transport to a stand-in answering `size` bytes of `x` with
+  # `status`, counting the requests, while the block runs.
+  def with_stand_in(status: Int, size: Int, &: (AWS::Transport, String, Atom[Int]) -> Void) -> Void
+    calls = Atom.new(0)
+    handler = HTTP.handler do |_|
+      calls.update { |c| c + 1 }
+      HTTP::Server::Response.text("x" * size, status)
+    end
+    server = HTTP::Server.new(handler, host: "127.0.0.1", port: 0)
+    Task.scope do |scope|
+      scope.spawn { server.serve }
+      begin
+        creds = AWS::Credentials.static(access_key_id: KEY_ID, secret_access_key: SECRET)
+        url = "http://127.0.0.1:#{server.local_address.port}/"
+        config = AWS::Config.new(region: "us-east-1", credentials: creds, http: HTTP::Client.new(proxy: nil), retries: 3,
+                                 timeout: 5.seconds, retry_base: 1.milliseconds, retry_cap: 4.milliseconds)
+        yield AWS::Transport.new(config, "kms", ["Retried"], Array[String].new), url, calls
+      ensure
+        server.shutdown
+      end
+    end
+    nil
+  end
+
+  def error_of -> (Int, HTTP::Headers, String) -> AWS::ServiceError
+    ->(status: Int, headers: HTTP::Headers, text: String) { AWS::ServiceError.new(code: "Retried", message: "", status: status) }
+  end
+
+  def test_an_answer_past_the_bound_is_a_transport_error_not_tried_again
+    with_stand_in(200, 101) do |t, url, calls|
+      e = assert_raise(AWS::TransportError) { t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of) }
+      assert_equal("Test Op: answered more than 100 bytes", e.message)
+      assert_equal(1, calls.get)
+    end
+    with_stand_in(200, 100) do |t, url, calls|
+      assert_equal(100, t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of).body.size)
+    end
+    # An error answer past the bound, too: not read as the service's error.
+    with_stand_in(500, 101) do |t, url, calls|
+      assert_raise(AWS::TransportError) { t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of) }
+      assert_equal(1, calls.get)
+    end
+  end
+
+  def test_a_retried_code_is_tried_again
+    with_stand_in(400, 2) do |t, url, calls|
+      e = assert_raise(AWS::ServiceError) { t.send(HTTP::Client::Request.get(url), "Test Op", 100, error_of) }.as(AWS::ServiceError)
+      assert_equal("Retried", e.code)
+      assert_equal(4, calls.get)
+    end
+  end
+
+  def test_an_answer_shows_no_body
+    a = AWS::Transport::Answer.new(200, HTTP::Headers.empty, b"secret")
+    assert_equal("#<AWS::Transport::Answer 200, 6 bytes>", a.inspect)
+  end
+end

@@ -1,0 +1,140 @@
+require "http"
+
+# :nodoc:
+# What every client of this cog shares, so that none has a copy of its
+# own and the services never refer to each other: a request sent for one
+# service, signed (SigV4) at each attempt with the clock-skew correction,
+# under the configuration's `timeout`; its answer read with a bound; and
+# the retries, with full-jitter backoff. Shareable: a client holds one,
+# used from any task.
+#
+# Tried again (at most `config.retries` times):
+#
+# - an answer with status 429, 500, 502, 503 or 504, or one whose error
+#   code is in the service's retried codes;
+# - a [TransportError] of the connection: it failed, broke, or gave no
+#   answer within `timeout`.
+#
+# Not tried again: any other error answer, and the [TransportError] of
+# an answer larger than the read bound (the same request would get the
+# same answer).
+#
+# An error answer whose code is one of the service's skew codes, when the
+# answer's Date header is over 4 minutes from our clock as corrected so
+# far, corrects the clock once and sends again, as botocore does.
+class Transport
+  include Shareable
+
+  # An answer: its status, headers and body (read whole, within the
+  # bound).
+  data Answer(status: Int, headers: HTTP::Headers, body: Bytes)
+    # The body as text; a body that is not UTF-8 gives a
+    # [ServiceError] "MalformedAnswer" naming `what`.
+    def text(what: String) -> String
+      body.decode? || raise ServiceError.new(code: "MalformedAnswer", message: "#{what} answered a body that is not UTF-8", status: status)
+    end
+
+    # `#<AWS::Transport::Answer 200, 12 bytes>`: not the body.
+    def inspect -> String = "#<AWS::Transport::Answer #{status}, #{body.size} bytes>"
+
+    # As [inspect].
+    def to_s -> String = inspect
+  end
+
+  @config: Config
+  @service: String
+  @retried: Array[String]
+  @skew_codes: Array[String]
+  # The server's clock minus ours, in milliseconds, once an answer said
+  # they differ.
+  @skew: Atom[Int]
+
+  # A transport for `service` (its signing name: `kms`, `s3`) with
+  # `config`'s region, credentials, client, timeout and retries; the
+  # error codes tried again (`retried`) and those that may mean the
+  # clock is off (`skew_codes`) are the service's.
+  def initialize(@config: Config, @service: String, @retried: Array[String], @skew_codes: Array[String])
+    @skew = Atom.new(0)
+  end
+
+  # The answer to `request` (unsigned: it is signed at each attempt),
+  # tried again as the class says. A 2xx answer is returned; another is
+  # raised as `error` makes it of the status, headers and body text.
+  # `what` names the call in errors ("KMS Encrypt"); `read_limit` bounds
+  # the body read (more is a [TransportError]).
+  def send(request: HTTP::Client::Request, what: String, read_limit: Int,
+           error: (Int, HTTP::Headers, String) -> ServiceError) -> Answer
+    attempt = 0
+    skewed = false
+    loop do
+      used = @skew.get
+      answer = begin
+                 once(request, what, read_limit, used)
+               rescue HTTP::Client::ResponseTooLarge
+                 # (Not tried again: the same request would get the same
+                 # answer.)
+                 raise TransportError.new("#{what}: answered more than #{read_limit} bytes")
+               rescue TransportError => e
+                 raise e if attempt >= @config.retries
+                 backoff(attempt)
+                 attempt += 1
+                 next
+               end
+      return answer if answer.status >= 200 && answer.status <= 299
+      failure = error.call(answer.status, answer.headers, answer.body.decode? || "")
+      if !skewed && @skew_codes.include?(failure.code)
+        if server = Time.httpdate?(answer.headers["date"] || "")
+          # (Corrected when the server's clock is over 4 minutes from
+          # ours as corrected so far, either way, as botocore does;
+          # against the skew this request was signed with, since another
+          # task may have corrected it since.)
+          diff = (server - Time.now).to_ms
+          if (diff - used).abs > 240_000
+            @skew.set(diff)
+            skewed = true
+            next
+          end
+        end
+      end
+      raise failure unless attempt < @config.retries && retry?(failure)
+      backoff(attempt)
+      attempt += 1
+    end
+  end
+
+  # Whether `e` may pass when tried again.
+  def retry?(e: ServiceError) -> Bool
+    s = e.status
+    s == 429 || s == 500 || s == 502 || s == 503 || s == 504 || @retried.include?(e.code)
+  end
+
+  # One attempt: `request` signed with the skew `skew`, sent, its answer
+  # read within `read_limit` bytes, under the timeout.
+  private def once(request: HTTP::Client::Request, what: String, read_limit: Int, skew: Int) -> Answer
+    keys = @config.credentials.get
+    signed = SigV4.sign(request, service: @service, region: @config.region, credentials: keys, time: Time.now + skew.milliseconds)
+    begin
+      Task.timeout(@config.timeout) do
+        res = @config.http.request(signed)
+        Answer.new(res.status, res.headers, res.body.read_bytes(max: read_limit))
+      end
+    rescue HTTP::Client::ResponseTooLarge => tl
+      # (Left to `send`, which does not try it again.)
+      raise tl
+    rescue HTTP::Client::Error => e
+      raise TransportError.new("#{what}: #{e.class.name}: #{e.message}")
+    rescue Task::Timeout
+      raise TransportError.new("#{what}: no answer within #{@config.timeout}")
+    end
+  end
+
+  # Waits before retry `attempt` (from 0): a random time up to
+  # `min(retry_cap, retry_base * 2**attempt)`.
+  private def backoff(attempt: Int) -> Void
+    cap = @config.retry_cap.to_ms
+    ceiling = @config.retry_base.to_ms
+    attempt.times { ceiling = ceiling * 2 if ceiling < cap }
+    ceiling = cap if ceiling > cap
+    Task.sleep(Random.rand(0..ceiling).milliseconds) if ceiling > 0
+  end
+end
