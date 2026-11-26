@@ -218,6 +218,10 @@ out = s3.put_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json"
                     server_side_encryption: :aws_kms, ssekms_key_id: "alias/exports",
                     expected_bucket_owner: "123456789012", metadata: {"source" => "daily"})
 out.etag; out.version_id; out.checksum   # an AWS::S3::Checksum(:sha256, base64), or nil
+
+got = s3.get_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json", max_bytes: 64 * 1024 * 1024)
+got.body; got.checksum_verified; got.object_lock_retain_until_date
+s3.head_object(bucket: "exports-123456789012", key: "daily/2026-11-26.json").content_length
 ```
 
 - `put_object(bucket:, key:, body:, ...)` writes one object in one PUT
@@ -243,6 +247,27 @@ out.etag; out.version_id; out.checksum   # an AWS::S3::Checksum(:sha256, base64)
   a bucket operation), a bucket name outside S3's rules, an account id that is not 12
   digits, a symbol outside an option's, or a header value with a
   control character is an `ArgumentError` before anything is sent.
+- `get_object(bucket:, key:, max_bytes:, version_id:, expected_bucket_owner:)`
+  reads an object whole: `max_bytes` is a bound, not a range, and a
+  larger object raises [AWS::S3::ObjectTooLarge] (from its
+  Content-Length, before reading) instead of giving a cut body. The
+  result has the body, content type, ETag, version id, last
+  modification, metadata (`x-amz-meta-*`, names lowercased without the
+  prefix), the Object Lock mode, retention date and legal hold, and the
+  checksum S3 gives (asked with `x-amz-checksum-mode: ENABLED`). A
+  SHA-256 of the whole object is checked against the body
+  ([AWS::S3::ChecksumMismatch] when it differs, neither value shown) and
+  `checksum_verified` is true. A checksum of another algorithm (the
+  standard library has no CRC32, CRC32C, CRC64NVME or SHA-1) or of a
+  multipart upload (a checksum of checksums, `...-N`) is left unchecked:
+  `checksum_verified` false, never a mismatch.
+- `head_object(bucket:, key:, version_id:, expected_bucket_owner:)`:
+  the same without the body, with `content_length`. A HEAD answer has
+  no body, so its errors are named from the status (the SDKs' names):
+  `NotFound` (404), `Forbidden` (403), and [AWS::S3::WrongRegion] from
+  `x-amz-bucket-region`. For a missing key, S3 answers 403 rather than
+  404 (`AccessDenied` for GET) when the caller may not list the bucket;
+  the error keeps the status.
 - Errors are S3's XML error documents as [AWS::ServiceError]s, matched
   on `code` (`AccessDenied`, `NoSuchBucket`, `InvalidRequest` for the
   Object Lock refusals, ...); a bucket in another region (301
@@ -268,7 +293,7 @@ out.etag; out.version_id; out.checksum   # an AWS::S3::Checksum(:sha256, base64)
 
 ### Not there yet
 
-S3's `get_object`, `head_object` and `list_objects_v2` (next), multipart
+S3's `list_objects_v2` (next), ranged reads, multipart
 uploads, bucket management, copy, delete and ACLs; other services
 (SQS, STS beyond the credentials); presigned S3 uploads beyond
 [AWS::SigV4.presign] itself; a data-key cache for [AWS::KMS::Envelope].

@@ -42,6 +42,45 @@ class S3
   # checksum S3 gave back (nil when it gave none).
   data PutObjectOutput = (etag: String, version_id: String?, checksum: Checksum?)
 
+  # `get_object`'s answer: the body, and what [HeadObjectOutput] has.
+  # [checksum] is the one S3 gave (asked with `x-amz-checksum-mode:
+  # ENABLED`); [checksum_verified] is true when it was checked against
+  # the body and matched: a SHA-256 of the whole object. A checksum of
+  # another algorithm (the standard library has no CRC32, CRC32C,
+  # CRC64NVME or SHA-1), or of a multipart upload's parts (a checksum of
+  # checksums, `...-N`), is not checked: false, never a mismatch.
+  data GetObjectOutput(body: Bytes, content_type: String?, etag: String, version_id: String?, last_modified: Time?,
+                          metadata: Hash[String, String], object_lock_mode: Symbol?, object_lock_retain_until_date: Time?,
+                          object_lock_legal_hold: Bool?, checksum: Checksum?, checksum_verified: Bool)
+    # Without the body: its size only.
+    def inspect -> String
+      "#<AWS::S3::GetObjectOutput #{body.size} bytes, etag: #{etag}, version_id: #{version_id.inspect}>"
+    end
+
+    # As [inspect].
+    def to_s -> String = inspect
+  end
+
+  # `head_object`'s answer: the object's size (`Content-Length`), content
+  # type, ETag, version id, last modification, metadata (`x-amz-meta-*`,
+  # by name lowercased, without the prefix), its Object Lock mode
+  # (`:governance`, `:compliance`), retention date and legal hold, and
+  # the checksum S3 gave (not checked: there is no body).
+  data HeadObjectOutput = (content_length: Int, content_type: String?, etag: String, version_id: String?, last_modified: Time?,
+                           metadata: Hash[String, String], object_lock_mode: Symbol?, object_lock_retain_until_date: Time?,
+                           object_lock_legal_hold: Bool?, checksum: Checksum?)
+
+  # `get_object`'s object is larger than its `max_bytes`: raised from
+  # its `Content-Length` before the body is read (or while reading, past
+  # the bound), not tried again.
+  class ObjectTooLarge < Error
+  end
+
+  # The body `get_object` read does not match the checksum S3 gave for
+  # it (neither value is in the message). Not tried again.
+  class ChecksumMismatch < Error
+  end
+
   # The bucket is in another region than the request's: S3 answered 301
   # `PermanentRedirect` or 400 `AuthorizationHeaderMalformed`, which is
   # raised rather than followed. [region] is the bucket's, when S3 said
@@ -213,6 +252,82 @@ class S3
     req
   end
 
+  # Reads the object `key` of `bucket` (its `version_id` when given),
+  # whole, within `max_bytes` (a bound, not a range: a larger object is
+  # [ObjectTooLarge], never a cut body). Asks for the object's checksum
+  # and checks a SHA-256 of the whole object against the body (see
+  # [GetObjectOutput]).
+  #
+  # ## Raises
+  #
+  # [ArgumentError] before anything is sent (as for `put_object`; and a
+  # `max_bytes` below 0); [ObjectTooLarge]; [ChecksumMismatch];
+  # [ServiceError] for S3's errors, `NoSuchKey` (404) for a missing key,
+  # or `AccessDenied` (403) for a missing key when the caller may not
+  # list the bucket (S3 does not say which; the status is kept); [WrongRegion];
+  # [TransportError] when no answer came.
+  def get_object(*, bucket: String, key: String, max_bytes: Int, version_id: String? = nil,
+                 expected_bucket_owner: String? = nil) -> GetObjectOutput
+    raise ArgumentError.new("max_bytes: at least 0, not #{max_bytes}") if max_bytes < 0
+    req = read_request("GET", bucket: bucket, key: key, version_id: version_id, expected_bucket_owner: expected_bucket_owner)
+    big = ObjectTooLarge.new("S3 GetObject: the object is larger than max_bytes (#{max_bytes})")
+    answer = @transport.send(req, "S3 GetObject", ANSWER_LIMIT, ->(status: Int, h: HTTP::Headers, text: String) { S3.error(status, h, text) },
+                             success_limit: max_bytes, too_large: big)
+    h = answer.headers
+    checksum = S3.checksum_of(h)
+    verified = false
+    if (c = checksum) && c.algorithm == :sha256 && !S3.composite?(h, c)
+      unless c.value == Base64.encode(Digest::SHA256.digest(answer.body))
+        raise ChecksumMismatch.new("S3 GetObject: the body does not match the SHA-256 checksum S3 gave")
+      end
+      verified = true
+    end
+    GetObjectOutput.new(answer.body, h["content-type"], h["etag"] || "", h["x-amz-version-id"], S3.last_modified(h),
+                        S3.metadata_of(h), S3.lock_mode(h), S3.retain_until(h), S3.legal_hold(h), checksum, verified)
+  end
+
+  # What `get_object` gives without the body: whether the object exists,
+  # its size and its metadata.
+  #
+  # ## Raises
+  #
+  # As `get_object`. A HEAD answer has no body, so an error has a code
+  # synthesized from its status: `NotFound` (404), `Forbidden` (403: also
+  # a missing key when the caller may not list the bucket), `HTTP<status>`
+  # else; [WrongRegion] from `x-amz-bucket-region`.
+  def head_object(*, bucket: String, key: String, version_id: String? = nil,
+                  expected_bucket_owner: String? = nil) -> HeadObjectOutput
+    req = read_request("HEAD", bucket: bucket, key: key, version_id: version_id, expected_bucket_owner: expected_bucket_owner)
+    answer = @transport.send(req, "S3 HeadObject", ANSWER_LIMIT, ->(status: Int, h: HTTP::Headers, text: String) { S3.error(status, h, "") })
+    h = answer.headers
+    length = h["content-length"] || ""
+    unless length.match?(/\A[0-9]{1,18}\z/)
+      raise ServiceError.new(code: "MalformedAnswer", message: "S3 HeadObject answered no Content-Length", status: answer.status)
+    end
+    HeadObjectOutput.new(length.to_i, h["content-type"], h["etag"] || "", h["x-amz-version-id"], S3.last_modified(h),
+                         S3.metadata_of(h), S3.lock_mode(h), S3.retain_until(h), S3.legal_hold(h), S3.checksum_of(h))
+  end
+
+  # :nodoc:
+  # The unsigned GET or HEAD of `key` (its version when given), asking
+  # for the checksum, its arguments checked.
+  def read_request(method: String, *, bucket: String, key: String, version_id: String? = nil,
+                   expected_bucket_owner: String? = nil) -> HTTP::Client::Request
+    S3.check_bucket(bucket)
+    url = url_for(bucket, key)
+    if (v = version_id)
+      raise ArgumentError.new("version_id: empty") if v.empty?
+      url = url.with(query: "versionId=#{SigV4.encode(v)}")
+    end
+    req = method == "HEAD" ? HTTP::Client::Request.head(url) : HTTP::Client::Request.get(url)
+    req = req.header("x-amz-checksum-mode", "ENABLED")
+    if owner = expected_bucket_owner
+      raise ArgumentError.new("expected_bucket_owner: an account id of 12 digits") unless owner.match?(/\A[0-9]{12}\z/)
+      req = req.header("x-amz-expected-bucket-owner", owner)
+    end
+    req
+  end
+
   # :nodoc:
   # The URL of `key` in `bucket`: virtual-hosted, or path style for a
   # dotted bucket name or an overridden endpoint (see the class). Every
@@ -266,6 +381,65 @@ class S3
   end
 
   # :nodoc:
+  # Whether `c` is a checksum of a multipart upload's parts (S3's
+  # `x-amz-checksum-type: COMPOSITE`, or a value ending `-N`), which no
+  # body can be checked against.
+  def self.composite?(h: HTTP::Headers, c: Checksum) -> Bool
+    (h["x-amz-checksum-type"] || "").upcase == "COMPOSITE" || c.value.match?(/-[0-9]+\z/)
+  end
+
+  # :nodoc:
+  # `x-amz-meta-*`, by the name after the prefix, lowercased.
+  def self.metadata_of(h: HTTP::Headers) -> Hash[String, String]
+    m = Hash[String, String].new
+    h.each do |n, v|
+      name = n.downcase
+      m = m.put(name.delete_prefix("x-amz-meta-"), v) if name.start_with?("x-amz-meta-") && name.size > 11
+    end
+    m
+  end
+
+  # :nodoc:
+  # `Last-Modified`, nil when absent or not an HTTP date.
+  def self.last_modified(h: HTTP::Headers) -> Time? = Time.httpdate?(h["last-modified"] || "")
+
+  # :nodoc:
+  # The Object Lock mode an answer gives. Another value than S3's two is
+  # a [ServiceError] "MalformedAnswer".
+  def self.lock_mode(h: HTTP::Headers) -> Symbol?
+    case h["x-amz-object-lock-mode"]
+    in nil then nil
+    in "GOVERNANCE" then :governance
+    in "COMPLIANCE" then :compliance
+    else raise ServiceError.new(code: "MalformedAnswer", message: "S3 answered an Object Lock mode that is not GOVERNANCE or COMPLIANCE", status: 200)
+    end
+  end
+
+  # :nodoc:
+  # The retention date an answer gives (ISO 8601); a malformed one is a
+  # [ServiceError] "MalformedAnswer".
+  def self.retain_until(h: HTTP::Headers) -> Time?
+    text = h["x-amz-object-lock-retain-until-date"]
+    return nil if text.nil?
+    begin
+      Time.iso8601(text)
+    rescue ArgumentError
+      raise ServiceError.new(code: "MalformedAnswer", message: "S3 answered a retention date that is not ISO 8601", status: 200)
+    end
+  end
+
+  # :nodoc:
+  # The legal hold an answer gives (`ON`, `OFF`), nil without one.
+  def self.legal_hold(h: HTTP::Headers) -> Bool?
+    case h["x-amz-object-lock-legal-hold"]
+    in nil then nil
+    in "ON" then true
+    in "OFF" then false
+    else raise ServiceError.new(code: "MalformedAnswer", message: "S3 answered a legal hold that is not ON or OFF", status: 200)
+    end
+  end
+
+  # :nodoc:
   # The checksum an answer's headers give, the one sent first.
   def self.checksum_of(h: HTTP::Headers) -> Checksum?
     CHECKSUM_HEADERS.each do |alg, name|
@@ -280,9 +454,12 @@ class S3
   # The error of an answer: S3's XML document (`Code`, `Message`,
   # `RequestId`), or the status alone when there is none (a HEAD, a
   # 301, a proxy's page). Without S3's document the code is synthesized
-  # here, not S3's: `PermanentRedirect` for a 301, `SlowDown` for a 503
-  # (tried again through its status either way), `HTTP<status>` else. A
-  # wrong region raises [WrongRegion] naming the bucket's.
+  # here, not S3's (the SDKs' names): `PermanentRedirect` for a 301,
+  # `SlowDown` for a 503 (tried again through its status either way),
+  # `NotFound` for a 404, `Forbidden` for a 403, for a 400 with
+  # `x-amz-bucket-region` `AuthorizationHeaderMalformed` (a HEAD to the
+  # wrong region), `HTTP<status>` else. A wrong region raises
+  # [WrongRegion] naming the bucket's.
   def self.error(status: Int, headers: HTTP::Headers, text: String) -> ServiceError
     f = begin
           XML.fields(text, ["Code", "Message", "RequestId", "Region"], ["Error"])
@@ -290,7 +467,16 @@ class S3
           Hash[String, String].new
         end
     code = f["Code"]? || ""
-    code = status == 301 ? "PermanentRedirect" : (status == 503 ? "SlowDown" : "HTTP#{status}") if code.empty?
+    if code.empty?
+      code = case status
+             in 301 then "PermanentRedirect"
+             in 503 then "SlowDown"
+             in 404 then "NotFound"
+             in 403 then "Forbidden"
+             in 400 then headers["x-amz-bucket-region"] ? "AuthorizationHeaderMalformed" : "HTTP400"
+             else "HTTP#{status}"
+             end
+    end
     message = f["Message"]? || ""
     request_id = f["RequestId"]? || headers["x-amz-request-id"]
     if code == "PermanentRedirect" || code == "AuthorizationHeaderMalformed"

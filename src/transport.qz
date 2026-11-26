@@ -15,9 +15,10 @@ require "http"
 # - a [TransportError] of the connection: it failed, broke, or gave no
 #   answer within `timeout`.
 #
-# Not tried again: any other error answer, and the [TransportError] of
-# an answer larger than the read bound (the same request would get the
-# same answer).
+# Not tried again: any other error answer, the [TransportError] of an
+# answer larger than the read bound (the same request would get the
+# same answer), and the caller's `too_large` for a 2xx answer past its
+# own bound.
 #
 # An error answer whose code is one of the service's skew codes, when the
 # answer's Date header is over 4 minutes from our clock as corrected so
@@ -41,6 +42,12 @@ class Transport
     def to_s -> String = inspect
   end
 
+  # :nodoc:
+  # A 2xx answer past `send`'s `success_limit`, left by `once` to `send`,
+  # which raises the caller's error for it without trying again.
+  class PastBound < StandardError
+  end
+
   @config: Config
   @service: String
   @retried: Array[String]
@@ -61,19 +68,25 @@ class Transport
   # tried again as the class says. A 2xx answer is returned; another is
   # raised as `error` makes it of the status, headers and body text.
   # `what` names the call in errors ("KMS Encrypt"); `read_limit` bounds
-  # the body read (more is a [TransportError]).
+  # the body read (more is a [TransportError]). A 2xx answer is read
+  # within `success_limit` instead when given (an object's body), and one
+  # past it, by its Content-Length before any of it is read or while
+  # reading, raises `too_large`.
   def send(request: HTTP::Client::Request, what: String, read_limit: Int,
-           error: (Int, HTTP::Headers, String) -> ServiceError) -> Answer
+           error: (Int, HTTP::Headers, String) -> ServiceError, *, success_limit: Int? = nil,
+           too_large: Exception? = nil) -> Answer
     attempt = 0
     skewed = false
     loop do
       used = @skew.get
       answer = begin
-                 once(request, what, read_limit, used)
+                 once(request, what, read_limit, used, success_limit)
                rescue HTTP::Client::ResponseTooLarge
                  # (Not tried again: the same request would get the same
                  # answer.)
                  raise TransportError.new("#{what}: answered more than #{read_limit} bytes")
+               rescue PastBound
+                 raise too_large || TransportError.new("#{what}: answered more than #{success_limit || read_limit} bytes")
                rescue TransportError => e
                  raise e if attempt >= @config.retries
                  backoff(attempt)
@@ -109,18 +122,40 @@ class Transport
   end
 
   # One attempt: `request` signed with the skew `skew`, sent, its answer
-  # read within `read_limit` bytes, under the timeout.
-  private def once(request: HTTP::Client::Request, what: String, read_limit: Int, skew: Int) -> Answer
+  # read within `read_limit` bytes (a 2xx within `success_limit`), under
+  # the timeout. An answer past a bound leaves as what `send` does not
+  # try again: [HTTP::Client::ResponseTooLarge], or [PastBound] for a
+  # 2xx past `success_limit` (by its Content-Length before any of it is
+  # read, or while reading). The response is then dropped unread, which
+  # closes its connection rather than giving it back to the client's
+  # pool ([HTTP::Client::Response]).
+  private def once(request: HTTP::Client::Request, what: String, read_limit: Int, skew: Int,
+                   success_limit: Int?) -> Answer
     keys = @config.credentials.get
     signed = SigV4.sign(request, service: @service, region: @config.region, credentials: keys, time: Time.now + skew.milliseconds)
     begin
       Task.timeout(@config.timeout) do
         res = @config.http.request(signed)
-        Answer.new(res.status, res.headers, res.body.read_bytes(max: read_limit))
+        ok = res.status >= 200 && res.status <= 299
+        if ok && (limit = success_limit)
+          if (n = res.headers["content-length"]) && n.match?(/\A[0-9]{1,18}\z/) && n.to_i > limit
+            raise PastBound.new("")
+          end
+          body = begin
+                   res.body.read_bytes(max: limit)
+                 rescue HTTP::Client::ResponseTooLarge
+                   raise PastBound.new("")
+                 end
+          Answer.new(res.status, res.headers, body)
+        else
+          Answer.new(res.status, res.headers, res.body.read_bytes(max: read_limit))
+        end
       end
     rescue HTTP::Client::ResponseTooLarge => tl
       # (Left to `send`, which does not try it again.)
       raise tl
+    rescue PastBound => pb
+      raise pb
     rescue HTTP::Client::Error => e
       raise TransportError.new("#{what}: #{e.class.name}: #{e.message}")
     rescue Task::Timeout
