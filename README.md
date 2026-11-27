@@ -133,7 +133,7 @@ longest an attempt may take. [AWS::Config.default] reads `AWS_REGION`,
 ```crystal
 kms = AWS::KMS.new(config)   # Shareable: one per program
 
-out = kms.encrypt(key_id: "alias/app", plaintext: secret, encryption_context: {"tenant" => "t1"})
+out = kms.encrypt(key_id: "alias/app", plaintext: secret, encryption_context: {"tenant" => "t1"})   # Bytes, a String or a Bytes::Secret (the request body holds it, in Base64)
 kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: {"tenant" => "t1"}).plaintext   # a Bytes::Secret: wipe it when done
 
 dk = kms.generate_data_key(key_id: "alias/app", key_spec: :aes_256)   # dk.plaintext (a Bytes::Secret), dk.ciphertext_blob
