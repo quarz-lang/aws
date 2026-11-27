@@ -278,7 +278,14 @@ class KMSTest < Test::Case
       assert_equal(64, kms.generate_data_key(key_id: "alias/app", number_of_bytes: 64).plaintext.size)
       wo = kms.generate_data_key_without_plaintext(key_id: "alias/app")
       assert_equal(32, kms.decrypt(ciphertext_blob: wo.ciphertext_blob).plaintext.size)
-      assert_equal(24, kms.generate_random(number_of_bytes: 24).plaintext.size)
+      random = kms.generate_random(number_of_bytes: 24)
+      assert_equal(24, random.plaintext.size)
+      # aws#23: a secret, decoded straight into it; not in inspect.
+      assert_equal("#<Bytes::Secret>", random.plaintext.inspect)
+      assert_equal("#<AWS::KMS::RandomOutput 24 bytes>", random.inspect)
+      refute(random.to_h.inspect.include?(random.plaintext.expose_bytes.inspect))
+      random.plaintext.wipe
+      assert_true(random.plaintext.wiped?)
     end
   end
 

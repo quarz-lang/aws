@@ -143,7 +143,7 @@ sig = kms.sign(key_id: "alias/sign", message: bytes, signing_algorithm: :rsassa_
 kms.verify(key_id: "alias/sign", message: bytes, signature: sig, signing_algorithm: :rsassa_pkcs1_v1_5_sha_256)   # => Bool
 pub = kms.get_public_key(key_id: "alias/sign")                 # pub.public_key: DER, Crypto::RSA::PublicKey.from_der
 kms.describe_key(key_id: "alias/app").enabled?
-kms.generate_random(number_of_bytes: 32).plaintext
+kms.generate_random(number_of_bytes: 32).plaintext       # a Bytes::Secret (since aws#23): wipe it when done
 
 box = AWS::KMS::Envelope.new(kms, "alias/app", {"tenant" => "t1"})
 sealed = box.seal(large_secret)   # Bytes: a data key from KMS, AES-256-GCM
