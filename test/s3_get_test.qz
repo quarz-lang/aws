@@ -100,7 +100,7 @@ class S3GetTest < Test::Case
     assert_equal("https://exports.s3.eu-west-1.amazonaws.com/a%20b/c.json?versionId=3%2FL4kqtJl%2BcB%3D", r.url.to_s)
     assert_equal(["GET", "ENABLED", "123456789012"], [r.method, r.headers["x-amz-checksum-mode"] || "", r.headers["x-amz-expected-bucket-owner"] || ""])
     assert_equal("HEAD", c.read_request("HEAD", bucket: "exports", key: "k").method)
-    keys = AWS::Credentials::Keys.new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+    keys = AWS::Credentials::Keys.new("AKIDEXAMPLE", Bytes::Secret.of("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_bytes))
     signed = AWS::SigV4.sign(r, service: "s3", region: "eu-west-1", credentials: keys, time: Time.utc(2026, 11, 26))
     parts = AWS::SigV4.parts("GET", r.url, signed.headers.delete("authorization"), signed.headers["x-amz-content-sha256"] || "",
                              service: "s3", region: "eu-west-1", credentials: keys, time: Time.utc(2026, 11, 26))

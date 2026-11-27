@@ -8,7 +8,7 @@ require "http"
 # (docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html).
 #
 # ```
-# keys = AWS::Credentials::Keys.new(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+# keys = AWS::Credentials::Keys.new(access_key_id: "AKIDEXAMPLE", secret_access_key: Bytes::Secret.of(b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"))
 # req = HTTP::Client::Request.get("https://example.amazonaws.com/")
 # signed = AWS::SigV4.sign(req, service: "service", region: "us-east-1", credentials: keys, time: Time.utc(2015, 8, 30, 12, 36))
 # signed.headers["x-amz-date"]   # => "20150830T123600Z"
@@ -61,7 +61,8 @@ module SigV4
     h = SigV4.base_headers(request)
     h = h.put("x-amz-date", amz_date)
     if token = credentials.session_token
-      h = h.put("x-amz-security-token", token)
+      # (Text by nature: a String of the token per request.)
+      h = h.put("x-amz-security-token", token.expose_bytes.decode)
     end
     if service == "s3" || content_sha256 || payload_hash || unsigned_payload
       h = h.put("x-amz-content-sha256", hash)
@@ -81,7 +82,7 @@ module SigV4
   # `UNSIGNED-PAYLOAD` for `s3`, else the body's, as [.sign] takes it.
   #
   # ```
-  # keys = AWS::Credentials::Keys.new(access_key_id: "AKIDEXAMPLE", secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+  # keys = AWS::Credentials::Keys.new(access_key_id: "AKIDEXAMPLE", secret_access_key: Bytes::Secret.of(b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"))
   # req = HTTP::Client::Request.get("https://example.amazonaws.com/")
   # url = AWS::SigV4.presign(req, service: "service", region: "us-east-1", credentials: keys, expires_in: 1.hour, time: Time.utc(2015, 8, 30, 12, 36))
   # url.query.as(String).end_with?("X-Amz-Signature=e93c787ed7f371d5c6b165c1b38ede9550f4dce4144713e844b25b7192d3865d")   # => true
@@ -108,7 +109,7 @@ module SigV4
       ["X-Amz-SignedHeaders", names.join(";")]
     ]
     if token = credentials.session_token
-      params = params.push(["X-Amz-Security-Token", token])
+      params = params.push(["X-Amz-Security-Token", token.expose_bytes.decode])
     end
     added = params.map { |p| "#{SigV4.encode(p[0])}=#{SigV4.encode(p[1])}" }.join("&")
     # (A query signed before: its signature's parameters dropped.)
@@ -170,11 +171,11 @@ module SigV4
 
   # The key that signs for `service` in `region` on `date` (`20150830`):
   # `HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region), service), "aws4_request")`,
-  # as a [Bytes::Secret]: each key of the chain is one (aws#22), so only
-  # the first, `"AWS4" + secret`, is plain (until quarz-lang/quarz#1015
-  # can join a secret to other bytes).
-  def self.signing_key(secret: String, date: String, region: String, service: String) -> Bytes::Secret
-    k = Digest::HMAC.sha256_secret("AWS4#{secret}", date)
+  # as a [Bytes::Secret]: each key of the chain is one, the first
+  # `Bytes::Secret.join(["AWS4", secret])` too (aws#22), so no key of the
+  # chain is plain.
+  def self.signing_key(secret: Bytes::Secret, date: String, region: String, service: String) -> Bytes::Secret
+    k = Digest::HMAC.sha256_secret(Bytes::Secret.join(["AWS4", secret]), date)
     k = Digest::HMAC.sha256_secret(k, region)
     k = Digest::HMAC.sha256_secret(k, service)
     Digest::HMAC.sha256_secret(k, "aws4_request")

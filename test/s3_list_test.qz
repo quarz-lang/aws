@@ -41,7 +41,7 @@ data ListFake(targets: Atom[Array[String]], pages: Atom[Hash[String, String]], s
 end
 
 class S3ListTest < Test::Case
-  DOC_KEYS = AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+  DOC_KEYS = AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", Bytes::Secret.of("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_bytes))
 
   def with_fake(fake: ListFake, &: (AWS::S3) -> Void) -> Void
     server = HTTP::Server.new(fake.handler, host: "127.0.0.1", port: 0)
