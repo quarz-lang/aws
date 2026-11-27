@@ -222,6 +222,23 @@ class KMSTest < Test::Case
     end
   end
 
+  # aws#23: a Bytes::Secret plaintext encrypts as its bytes do; a wiped
+  # one raises before any request.
+  def test_encrypt_a_secret
+    fake = FakeKMS.make
+    KMSFakes.with(fake) do |kms|
+      key = Bytes::Secret.of(b"\x00\x01key material")
+      out = kms.encrypt(key_id: "alias/app", plaintext: key, encryption_context: ctx)
+      assert_equal(key, kms.decrypt(ciphertext_blob: out.ciphertext_blob, encryption_context: ctx).plaintext)
+      plain = kms.encrypt(key_id: "alias/app", plaintext: b"\x00\x01key material", encryption_context: ctx)
+      assert_equal(key, kms.decrypt(ciphertext_blob: plain.ciphertext_blob, encryption_context: ctx).plaintext)
+      before = fake.calls.get
+      key.wipe
+      assert_raise(Bytes::Secret::WipedError) { kms.encrypt(key_id: "alias/app", plaintext: key) }
+      assert_equal(before, fake.calls.get)
+    end
+  end
+
   # aws#30: a ciphertext moved to another key, the plaintext never in the
   # request or the answer.
   def test_re_encrypt

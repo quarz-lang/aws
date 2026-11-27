@@ -127,8 +127,13 @@ class KMS
   def to_s -> String = inspect
 
   # `plaintext` (up to 4096 bytes) encrypted under `key_id` (an id, an
-  # ARN, or `alias/name`), bound to `encryption_context`.
-  def encrypt(*, key_id: String, plaintext: Bytes | String, encryption_context: Hash[String, String] = Hash[String, String].new,
+  # ARN, or `alias/name`), bound to `encryption_context`. A
+  # [Bytes::Secret] plaintext (a key to wrap) is read through a copy that
+  # is cleared, but KMS takes it in the request's JSON body, in Base64:
+  # that body is a [String] that holds it, which nothing clears, for the
+  # length of the call (aws#23). A wiped one raises
+  # [Bytes::Secret::WipedError] before anything is sent.
+  def encrypt(*, key_id: String, plaintext: Bytes | String | Bytes::Secret, encryption_context: Hash[String, String] = Hash[String, String].new,
               grant_tokens: Array[String] = Array[String].new, encryption_algorithm: Symbol? = nil) -> EncryptOutput
     body = KMS.fields({"KeyId" => key_id, "Plaintext" => Base64.encode(plaintext)}, encryption_context, grant_tokens)
     if a = encryption_algorithm
