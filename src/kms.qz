@@ -91,8 +91,10 @@ class KMS
     def enabled? -> Bool = enabled
   end
 
-  # `generate_random`'s answer.
-  data RandomOutput(plaintext: Bytes)
+  # `generate_random`'s answer: the random bytes as a [Bytes::Secret]
+  # (they are usually key material), decoded straight into it; wipe it
+  # when done.
+  data RandomOutput(plaintext: Bytes::Secret)
     # `#<AWS::KMS::RandomOutput 32 bytes>`.
     def inspect -> String = "#<AWS::KMS::RandomOutput #{plaintext.size} bytes>"
 
@@ -241,10 +243,12 @@ class KMS
                     m["Enabled"]?&.as_bool? || false, KMS.str(m, "KeyState"), KMS.str(m, "Description"))
   end
 
-  # `number_of_bytes` random bytes (1 to 1024) from KMS.
+  # `number_of_bytes` random bytes (1 to 1024) from KMS, as a
+  # [Bytes::Secret] (decoded from the answer's Base64 straight into it, as
+  # `decrypt`'s plaintext is).
   def generate_random(*, number_of_bytes: Int) -> RandomOutput
     r = call("GenerateRandom", {"NumberOfBytes" => number_of_bytes.as(Object)})
-    RandomOutput.new(KMS.bytes(r, "Plaintext"))
+    RandomOutput.new(KMS.secret(r, "Plaintext"))
   end
 
   # :nodoc:
