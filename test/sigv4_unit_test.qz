@@ -13,6 +13,15 @@ class SigV4UnitTest < Test::Case
   def t -> Time = Time.utc(2013, 5, 24)
 
   # The S3 documentation's "GET Object" example (header signing).
+  # aws#22: the signing key is a Bytes::Secret, each step of its chain
+  # one; its value computed by an independent HMAC-SHA256 chain (Python's
+  # hmac), not by this cog.
+  def test_signing_key_is_a_secret
+    k = AWS::SigV4.signing_key("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20120215", "us-east-1", "iam")
+    assert_equal("#<Bytes::Secret>", k.inspect)
+    assert_equal("f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d", k.expose_bytes.hex)
+  end
+
   def test_s3_get_object_example
     req = HTTP::Client::Request.get("https://examplebucket.s3.amazonaws.com/test.txt", {"Range" => "bytes=0-9"})
     signed = AWS::SigV4.sign(req, service: "s3", region: "us-east-1", credentials: s3_keys, time: t)
