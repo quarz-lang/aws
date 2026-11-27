@@ -169,12 +169,15 @@ module SigV4
   end
 
   # The key that signs for `service` in `region` on `date` (`20150830`):
-  # `HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region), service), "aws4_request")`.
-  def self.signing_key(secret: String, date: String, region: String, service: String) -> Bytes
-    k = Digest::HMAC.sha256("AWS4#{secret}", date)
-    k = Digest::HMAC.sha256(k, region)
-    k = Digest::HMAC.sha256(k, service)
-    Digest::HMAC.sha256(k, "aws4_request")
+  # `HMAC(HMAC(HMAC(HMAC("AWS4" + secret, date), region), service), "aws4_request")`,
+  # as a [Bytes::Secret]: each key of the chain is one (aws#22), so only
+  # the first, `"AWS4" + secret`, is plain (until quarz-lang/quarz#1015
+  # can join a secret to other bytes).
+  def self.signing_key(secret: String, date: String, region: String, service: String) -> Bytes::Secret
+    k = Digest::HMAC.sha256_secret("AWS4#{secret}", date)
+    k = Digest::HMAC.sha256_secret(k, region)
+    k = Digest::HMAC.sha256_secret(k, service)
+    Digest::HMAC.sha256_secret(k, "aws4_request")
   end
 
   # The credential scope: `20150830/us-east-1/service/aws4_request`.
