@@ -3,11 +3,11 @@ require "test"
 class SigV4UnitTest < Test::Case
   # The example keys of the AWS documentation's S3 examples.
   def s3_keys -> AWS::Credentials::Keys
-    AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+    AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", Bytes::Secret.of("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_bytes))
   end
 
   def suite_keys -> AWS::Credentials::Keys
-    AWS::Credentials::Keys.new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+    AWS::Credentials::Keys.new("AKIDEXAMPLE", Bytes::Secret.of("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_bytes))
   end
 
   def t -> Time = Time.utc(2013, 5, 24)
@@ -17,7 +17,7 @@ class SigV4UnitTest < Test::Case
   # one; its value computed by an independent HMAC-SHA256 chain (Python's
   # hmac), not by this cog.
   def test_signing_key_is_a_secret
-    k = AWS::SigV4.signing_key("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20120215", "us-east-1", "iam")
+    k = AWS::SigV4.signing_key(Bytes::Secret.of(b"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"), "20120215", "us-east-1", "iam")
     assert_equal("#<Bytes::Secret>", k.inspect)
     assert_equal("f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d", k.expose_bytes.hex)
   end
@@ -44,14 +44,14 @@ class SigV4UnitTest < Test::Case
     req = HTTP::Client::Request.get("https://example.amazonaws.com/")
     assert_raise(ArgumentError) { AWS::SigV4.presign(req, service: "s", region: "r", credentials: suite_keys, expires_in: 0.seconds) }
     assert_raise(ArgumentError) { AWS::SigV4.presign(req, service: "s", region: "r", credentials: suite_keys, expires_in: 8.days) }
-    k = AWS::Credentials::Keys.new("AKIDEXAMPLE", "secret", "to+ken/=")
+    k = AWS::Credentials::Keys.new("AKIDEXAMPLE", Bytes::Secret.of("secret".to_bytes), Bytes::Secret.of("to+ken/=".to_bytes))
     url = AWS::SigV4.presign(req, service: "s", region: "r", credentials: k, expires_in: 1.minute)
     assert((url.query || "").include?("X-Amz-Security-Token=to%2Bken%2F%3D"))
   end
 
   def test_session_token_and_existing_authorization
     req = HTTP::Client::Request.get("https://example.amazonaws.com/").header("Authorization", "old").header("User-Agent", "x")
-    k = AWS::Credentials::Keys.new("AKIDEXAMPLE", "secret", "tok")
+    k = AWS::Credentials::Keys.new("AKIDEXAMPLE", Bytes::Secret.of("secret".to_bytes), Bytes::Secret.of("tok".to_bytes))
     signed = AWS::SigV4.sign(req, service: "service", region: "us-east-1", credentials: k, time: t)
     assert_equal("tok", signed.headers["x-amz-security-token"])
     assert_equal(1, signed.headers.all("authorization").size)
@@ -126,7 +126,7 @@ end
 
 # Fixes from the review of the first version.
 class SigV4ReviewFixesTest < Test::Case
-  def keys -> AWS::Credentials::Keys = AWS::Credentials::Keys.new("AKIDEXAMPLE", "secret")
+  def keys -> AWS::Credentials::Keys = AWS::Credentials::Keys.new("AKIDEXAMPLE", Bytes::Secret.of("secret".to_bytes))
 
   def test_host_is_the_urls
     req = HTTP::Client::Request.get("https://example.amazonaws.com/", {"Host" => "other.example"})
@@ -143,7 +143,7 @@ class SigV4ReviewFixesTest < Test::Case
 
   def test_signing_again_drops_the_old_signature
     req = HTTP::Client::Request.get("https://example.amazonaws.com/")
-    once = AWS::SigV4.sign(req, service: "s3", region: "r", credentials: AWS::Credentials::Keys.new("AKID", "s", "OLDTOKEN"))
+    once = AWS::SigV4.sign(req, service: "s3", region: "r", credentials: AWS::Credentials::Keys.new("AKID", Bytes::Secret.of("s".to_bytes), Bytes::Secret.of("OLDTOKEN".to_bytes)))
     again = AWS::SigV4.sign(once, service: "s", region: "r", credentials: keys)
     assert(!again.headers.key?("x-amz-security-token"))
     # (The payload hash an earlier signature set is the one used.)

@@ -85,7 +85,7 @@ end
 
 class S3Test < Test::Case
   # The example keys of the AWS documentation's S3 examples.
-  DOC_KEYS = AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+  DOC_KEYS = AWS::Credentials::Keys.new("AKIAIOSFODNN7EXAMPLE", Bytes::Secret.of("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_bytes))
 
   def client(region: String = "us-east-1") -> AWS::S3
     AWS::S3.new(AWS::Config.new(region: region, credentials: AWS::Credentials.static(access_key_id: "AKIAIOSFODNN7EXAMPLE",

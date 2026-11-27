@@ -176,7 +176,7 @@ data FakeKMS(calls: Atom[Int], script: Atom[Array[String]], offset: Atom[Int], s
     d = req.headers["x-amz-date"] || return false
     t = Time.utc(d[0, 4].to_i, d[4, 2].to_i, d[6, 2].to_i, d[9, 2].to_i, d[11, 2].to_i, d[13, 2].to_i)
     url = URI.parse("http://#{req.headers["host"]}#{req.target}")
-    keys = AWS::Credentials::Keys.new(KEY_ID, SECRET)
+    keys = AWS::Credentials::Keys.new(KEY_ID, Bytes::Secret.of(SECRET.to_bytes))
     parts = AWS::SigV4.parts(req.method, url, headers, Digest::SHA256.hexdigest(body), service: "kms", region: "us-east-1",
                              credentials: keys, time: t)
     parts.signature == m[3]

@@ -113,7 +113,7 @@ module Profiles
     secret = s["aws_secret_access_key"]?
     return nil if id.nil? || id.empty? || secret.nil? || secret.empty?
     token = s["aws_session_token"]?
-    Credentials::Keys.new(id, secret, token && !token.empty? ? token : nil, nil)
+    Credentials::Keys.new(id, Credentials.secret(secret), token && !token.empty? ? Credentials.secret(token) : nil, nil)
   end
 end
 
@@ -177,6 +177,6 @@ module STS
     if id.nil? || secret.nil? || token.nil? || exp.nil? || id.empty? || secret.empty?
       raise CredentialsError.new("STS #{action} answered without the keys")
     end
-    Credentials::Keys.new(id, secret, token, Credentials.time(exp, "STS #{action}"))
+    Credentials::Keys.new(id, Credentials.secret(secret), Credentials.secret(token), Credentials.time(exp, "STS #{action}"))
   end
 end

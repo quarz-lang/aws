@@ -21,7 +21,8 @@ data SuiteCase(
   def self.load(name: String) -> SuiteCase
     ctx = JSON.parse(SuiteCase.file(name, "context.json"))
     c = ctx["credentials"]
-    keys = AWS::Credentials::Keys.new(c["access_key_id"].as_s, c["secret_access_key"].as_s, c["token"]?&.as_s?, nil)
+    token = c["token"]?&.as_s?
+    keys = AWS::Credentials::Keys.new(c["access_key_id"].as_s, Bytes::Secret.of(c["secret_access_key"].as_s.to_bytes), token ? Bytes::Secret.of(token.to_bytes) : nil, nil)
     lines = SuiteCase.file(name, "request.txt").split("\n", -1)
     method, target, _ = lines[0].split(" ")
     headers = HTTP::Headers.empty

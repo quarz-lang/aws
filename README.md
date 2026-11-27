@@ -27,8 +27,21 @@ keys.inspect                       # => "#<AWS::Credentials::Keys ASIA... expire
 
 - `AWS::Credentials::Keys(access_key_id, secret_access_key, session_token, expires_at)`:
   `inspect` and `to_s` show the access key id and the expiry only.
+  The secret access key and the session token are `Bytes::Secret`s
+  (aws#22; **breaking**: `Keys.new` takes secrets for them, and code
+  reading them as Strings calls `expose_bytes`). `to_h` shows them as
+  `#<Bytes::Secret>`, and `JSON.generate` of keys, of a provider holding
+  them or of a `Config` raises `JSON::GeneratorError`. Every provider
+  wraps what it reads straight away; what it read from stays as it is
+  (`ENV`, the credentials file's text, an HTTP answer), and the session
+  token is sent as text with each request (`x-amz-security-token`, a
+  presigned URL's `X-Amz-Security-Token`), a String each time.
+  `SigV4.signing_key` takes the secret as a `Bytes::Secret`
+  (**breaking**) and keeps the whole key chain secret.
 - Providers ([AWS::Credentials::Provider], `get -> Keys`):
-  - `static(access_key_id:, secret_access_key:, session_token: nil)`;
+  - `static(access_key_id:, secret_access_key:, session_token: nil)`,
+    each secret a `String` (made a `Bytes::Secret`; the String stays as
+    given) or a `Bytes::Secret`;
   - `env`: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`;
   - `profile(name)`: `AWS_PROFILE`, else `default`, from
     `~/.aws/credentials` (`AWS_SHARED_CREDENTIALS_FILE`) and
